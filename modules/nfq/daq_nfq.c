@@ -30,7 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
-
+#include <pthread.h>
 #include <libmnl/libmnl.h>
 
 #include "daq_dlt.h"
@@ -62,6 +62,20 @@ typedef struct _nfq_msg_pool
     DAQ_MsgPoolInfo_t info;
 } NfqMsgPool;
 
+typedef struct _fifo_queue
+{
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t queue_mutex;
+    NfqPktDesc *desc_queue[DEFAULT_QUEUE_MAXLEN];
+} FIFOQueue;
+
+#define FIFO_ENQUEUE_FAILED -1
+#define FIFO_DEQUEUE_FAILED -1
+#define FIFO_FULL -2
+#define FIFO_EMPTY -3
+
 typedef struct _nfq_context
 {
     /* Configuration */
@@ -81,7 +95,18 @@ typedef struct _nfq_context
     int nlsock_fd;
     unsigned portid;
     volatile bool interrupted;
+
+    pthread_mutex_t descr_mutex;
+
+    pthread_t rx_thread_id;
+
+    FIFOQueue *rx_queue;
+
+    pthread_t tx_thread_id;
+    pthread_mutex_t tx_queue_mutex;
+    FIFOQueue *tx_queue;
 } Nfq_Context_t;
+
 
 static DAQ_VariableDesc_t nfq_variable_descriptions[] = {
     { "debug", "Enable debugging output to stdout", DAQ_VAR_DESC_FORBIDS_ARGUMENT },
@@ -101,6 +126,8 @@ static const DAQ_Verdict verdict_translation_table[MAX_DAQ_VERDICT] = {
 
 static DAQ_BaseAPI_t daq_base_api;
 
+void *nlq_rx_enqueue(void *data);
+void *nlq_tx_enqueue(void *data);
 
 /*
  * Private Functions
@@ -583,6 +610,31 @@ static int nfq_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstan
         goto fail;
     }
 
+    int ret;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+
+    FIFOQueue *fifoq = calloc(2, sizeof(FIFOQueue));
+    nfqc->rx_queue = fifoq;
+    fifoq++;
+    nfqc->tx_queue = fifoq;
+
+    ret = pthread_create(&nfqc->rx_thread_id, NULL, &nlq_rx_enqueue, nfqc);
+    if (ret != 0) {
+        SET_ERROR(modinst, "%s: Couldn't create rx thread for NFQ queue %u: %s (%d)",
+                __func__, nfqc->queue_num, strerror(ret), ret);
+    } else {
+        printf("Create rx thread %lu\n", nfqc->rx_thread_id);
+    }
+
+    ret = pthread_create(&nfqc->tx_thread_id, NULL, &nlq_tx_enqueue, nfqc);
+    if (ret != 0) {
+        SET_ERROR(modinst, "%s: Couldn't create rx thread for NFQ queue %u: %s (%d)",
+                __func__, nfqc->queue_num, strerror(ret), ret);
+    } else {
+        printf("Create tx thread %lu\n", nfqc->tx_thread_id);
+    }
+
     *ctxt_ptr = nfqc;
 
     return DAQ_SUCCESS;
@@ -610,6 +662,13 @@ static void nfq_daq_destroy(void *handle)
         mnl_socket_close(nfqc->nlsock);
     if (nfqc->nlmsg_buf)
         free(nfqc->nlmsg_buf);
+#ifdef WLR_ADD_THREAD_DESTORY_BEFORE_CAN_FREE
+    if (nfqc->rx_queue)
+        free(nfqc->rx_queue);
+    if (nfqc->tx_queue)
+        free(nfqc->tx_queue);
+#endif
+
     destroy_packet_pool(nfqc);
     free(nfqc);
 }
@@ -676,7 +735,6 @@ static int nfq_daq_get_snaplen(void *handle)
 
     return nfqc->snaplen;
 }
-
 /* Module->get_capabilities() */
 static uint32_t nfq_daq_get_capabilities(void *handle)
 {
@@ -687,6 +745,157 @@ static uint32_t nfq_daq_get_capabilities(void *handle)
 static int nfq_daq_get_datalink_type(void *handle)
 {
     return DLT_RAW;
+}
+static int enqueue_desc(FIFOQueue *fifo, NfqPktDesc *desc)
+{
+    if ((!desc) || (!fifo)) {
+       return FIFO_ENQUEUE_FAILED;
+    }
+
+    pthread_mutex_lock(&fifo->queue_mutex);
+    if (fifo->count >= (DEFAULT_QUEUE_MAXLEN-1)) {
+        pthread_mutex_unlock(&fifo->queue_mutex);
+        return FIFO_FULL;
+    }
+
+    fifo->desc_queue[fifo->tail] = desc;
+    fifo->tail++;
+    if (fifo->tail == DEFAULT_QUEUE_MAXLEN) {
+        fifo->tail = 0;
+    }
+    fifo->count++;
+    pthread_mutex_unlock(&fifo->queue_mutex);
+    return 0;
+}
+
+static NfqPktDesc *rx_dequeue_desc(FIFOQueue *fifo)
+{
+    if (!fifo) {
+       return NULL;
+    }
+
+    pthread_mutex_lock(&fifo->queue_mutex);
+    if (!fifo->count) {
+        pthread_mutex_unlock(&fifo->queue_mutex);
+        return NULL;
+    }
+
+    NfqPktDesc *desc = fifo->desc_queue[fifo->head];
+    fifo->count--;
+    fifo->head++;
+    if (fifo->head == DEFAULT_QUEUE_MAXLEN) {
+        fifo->head = 0;
+    }
+    pthread_mutex_unlock(&fifo->queue_mutex);
+    return desc;
+}
+
+
+static int put_free_desc(Nfq_Context_t *nfqc, NfqPktDesc *desc)
+{
+    if ((!nfqc) || (!desc)) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&nfqc->descr_mutex);
+    desc->nlmh = NULL;
+    desc->next = nfqc->pool.freelist;
+    nfqc->pool.freelist = desc;
+    nfqc->pool.info.available++;
+
+    pthread_mutex_unlock(&nfqc->descr_mutex);
+    return 0;
+}
+
+static NfqPktDesc *get_free_desc(Nfq_Context_t *nfqc)
+{
+    pthread_mutex_lock(&nfqc->descr_mutex);
+    NfqPktDesc *desc = nfqc->pool.freelist;
+    if (desc) {
+        nfqc->pool.freelist = desc->next;
+        desc->next = NULL;
+        nfqc->pool.info.available--;
+    }
+
+    pthread_mutex_unlock(&nfqc->descr_mutex);
+
+    return desc;
+}
+
+void *nlq_rx_enqueue(void *data) {
+    Nfq_Context_t *nfqc = data;
+    NfqPktDesc *desc = NULL;
+    DAQ_RecvStatus rstat;
+
+    printf("In the rx thread, queue %d\n", nfqc->queue_num);
+    while (!nfqc->interrupted) {
+
+        if (!desc) {
+            desc = get_free_desc(nfqc);
+            if (nfqc->debug)
+                printf("Got descriprior %p\n", desc);
+            if (!desc) {
+                usleep(500);
+                continue;
+            }
+        }
+
+        ssize_t ret = nl_socket_recv(nfqc, desc->nlmsg_buf, nfqc->nlmsg_bufsize, 1);
+        if (ret < 0)
+        {
+            if (nfqc->debug)
+                printf("Error from nl_socket_recv: %d %s\n", errno, strerror(errno));
+            if (errno == ENOBUFS)
+            {
+                nfqc->stats.hw_packets_dropped++;
+                continue;
+            }
+            else if (errno == EAGAIN || errno == EWOULDBLOCK)
+                rstat = DAQ_RSTAT_TIMEOUT;
+                //rstat = (idx == 0) ? DAQ_RSTAT_TIMEOUT : DAQ_RSTAT_WOULD_BLOCK;
+            else if (errno == EINTR)
+            {
+                continue;
+            }
+            else
+            {
+                SET_ERROR(nfqc->modinst, "%s: Socket receive failed: %zd - %s (%d)",
+                        __func__, ret, strerror(errno), errno);
+                rstat = DAQ_RSTAT_ERROR;
+            }
+            continue;
+        }
+        if (nfqc->debug)
+            printf("WLR: Process packet\n");
+        errno = 0;
+        ret = mnl_cb_run(desc->nlmsg_buf, ret, 0, nfqc->portid, process_message_cb, desc);
+        if (ret < 0)
+        {
+            SET_ERROR(nfqc->modinst, "%s: Netlink message processing failed: %zd - %s (%d)",
+                    __func__, ret, strerror(errno), errno);
+            rstat = DAQ_RSTAT_ERROR;
+            continue;
+        }
+
+
+        /* Increment the module instance's packet counter. */
+        nfqc->stats.packets_received++;
+        ret = enqueue_desc(nfqc->rx_queue, desc);
+        if (ret != 0) {
+            printf("Error enqueueing pkt: %ld\n", ret);
+        }
+        if (nfqc->debug)
+            printf("WLR: pkt enqueued %p\n", desc);
+        desc = NULL;
+    }
+    printf("Exiting rx thread\n");
+    return NULL;
+}
+
+void *nlq_tx_enqueue(void *data) {
+    Nfq_Context_t *nfqc = data;
+    printf("In the tx thread, queue %d\n", nfqc->queue_num);
+    return NULL;
 }
 
 /* Module->msg_receive() */
@@ -706,6 +915,7 @@ static unsigned nfq_daq_msg_receive(void *handle, const unsigned max_recv, const
             break;
         }
 
+#ifdef WLR_NO_PTHREAD
         /* Make sure that we have a packet descriptor available to populate. */
         NfqPktDesc *desc = nfqc->pool.freelist;
         if (!desc)
@@ -757,8 +967,17 @@ static unsigned nfq_daq_msg_receive(void *handle, const unsigned max_recv, const
         nfqc->pool.freelist = desc->next;
         desc->next = NULL;
         nfqc->pool.info.available--;
+#else // WLR_NO_PTHREADA
+        NfqPktDesc *desc = rx_dequeue_desc(nfqc->rx_queue);
+// WLR TODO: Add timeout or sleep loop here if idx = 0;
+        if (!desc) {
+            if (idx)
+                return idx;
+            else
+                continue;
+        }
         msgs[idx] = &desc->msg;
-
+#endif
         idx++;
     }
 
@@ -794,11 +1013,13 @@ static int nfq_daq_msg_finalize(void *handle, const DAQ_Msg_t *msg, DAQ_Verdict 
 
     /* Toss the descriptor back on the free list for reuse.
         Make sure to clear out the netlink message header to show that it is unused. */
+    put_free_desc(nfqc, desc);
+#ifdef WLR_PUT_REPLACED
     desc->nlmh = NULL;
     desc->next = nfqc->pool.freelist;
     nfqc->pool.freelist = desc;
     nfqc->pool.info.available++;
-
+#endif
     return DAQ_SUCCESS;
 }
 
