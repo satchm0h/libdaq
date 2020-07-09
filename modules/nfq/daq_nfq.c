@@ -21,6 +21,7 @@
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
+#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 
@@ -32,7 +33,18 @@
 #include <sys/time.h>
 #include <pthread.h>
 #include <libmnl/libmnl.h>
+#include <fcntl.h>
+#include <sched.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
 
+#include <linux/sched.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+//
 #include "daq_dlt.h"
 #include "daq_module_api.h"
 
@@ -42,6 +54,7 @@
 
 #define NFQ_DEFAULT_POOL_SIZE   16
 #define DEFAULT_QUEUE_MAXLEN    1024   // Based on NFQNL_QMAX_DEFAULT from nfnetlnk_queue_core.c
+#define POD2 "/var/run/netns/pod2"
 
 #define SET_ERROR(modinst, ...)    daq_base_api.set_errbuf(modinst, __VA_ARGS__)
 
@@ -50,6 +63,7 @@ typedef struct _nfq_pkt_desc
     DAQ_Msg_t msg;
     DAQ_PktHdr_t pkthdr;
     uint8_t *nlmsg_buf;
+    DAQ_Verdict verdict;
     const struct nlmsghdr *nlmh;
     struct nfqnl_msg_packet_hdr *nlph;
     struct _nfq_pkt_desc *next;
@@ -83,6 +97,7 @@ typedef struct _nfq_context
     int snaplen;
     int timeout;
     unsigned queue_maxlen;
+    char *netns_path;
     bool fail_open;
     bool debug;
     /* State */
@@ -112,6 +127,7 @@ static DAQ_VariableDesc_t nfq_variable_descriptions[] = {
     { "debug", "Enable debugging output to stdout", DAQ_VAR_DESC_FORBIDS_ARGUMENT },
     { "fail_open", "Allow the kernel to bypass the netfilter queue when it is full", DAQ_VAR_DESC_FORBIDS_ARGUMENT },
     { "queue_maxlen", "Maximum queue length (default: 1024)", DAQ_VAR_DESC_REQUIRES_ARGUMENT },
+    { "netns_path", "Path to the network namespace to create nfqueue socket", DAQ_VAR_DESC_REQUIRES_ARGUMENT },
 };
 
 static const DAQ_Verdict verdict_translation_table[MAX_DAQ_VERDICT] = {
@@ -128,6 +144,7 @@ static DAQ_BaseAPI_t daq_base_api;
 
 void *nlq_rx_enqueue(void *data);
 void *nlq_tx_enqueue(void *data);
+static void *nlq_initialize(void *data);
 
 /*
  * Private Functions
@@ -464,6 +481,10 @@ static int nfq_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstan
                 goto fail;
             }
         }
+        else if (!strcmp(varKey, "netns_path"))
+        {
+            nfqc->netns_path = strdup(varValue);
+        }
 
         daq_base_api.config_next_variable(modcfg, &varKey, &varValue);
     }
@@ -493,126 +514,25 @@ static int nfq_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstan
     if ((rval = create_packet_pool(nfqc, pool_size ? pool_size : NFQ_DEFAULT_POOL_SIZE)) != DAQ_SUCCESS)
         goto fail;
 
-    /* Open the netfilter netlink socket */
-    nfqc->nlsock = mnl_socket_open(NETLINK_NETFILTER);
-    if (!nfqc->nlsock)
-    {
-        SET_ERROR(modinst, "%s: Couldn't open netfilter netlink socket: %s (%d)",
-                __func__, strerror(errno), errno);
-        goto fail;
-    }
-    /* Cache the socket file descriptor for later use in the critical path for receive */
-    nfqc->nlsock_fd = mnl_socket_get_fd(nfqc->nlsock);
-
-    /* Implement the requested timeout by way of the receive timeout on the netlink socket */
     nfqc->timeout = daq_base_api.config_get_timeout(modcfg);
-    if (nfqc->timeout)
-    {
-        struct timeval tv;
-        tv.tv_sec = nfqc->timeout / 1000;
-        tv.tv_usec = (nfqc->timeout % 1000) * 1000;
-        if (setsockopt(nfqc->nlsock_fd, SOL_SOCKET, SO_RCVTIMEO, (const void*)&tv, sizeof(tv)) == -1)
-        {
-            SET_ERROR(modinst, "%s: Couldn't set receive timeout on netlink socket: %s (%d)",
-                    __func__, strerror(errno), errno);
-            goto fail;
-        }
-    }
 
-    /* Set the socket receive buffer to something reasonable based on the desired queue and capture lengths.
-        Try with FORCE first to allow overriding the system's global rmem_max, then fall back on being limited
-        by it if that doesn't work.
-        The value will be doubled to allow room for bookkeeping overhead, so the default of 1024 * 1500 will
-        end up allocating about 3MB of receive buffer space.  The unmodified default tends to be around 208KB. */
-    unsigned int socket_rcvbuf_size = nfqc->queue_maxlen * nfqc->snaplen;
-    if (setsockopt(nfqc->nlsock_fd, SOL_SOCKET, SO_RCVBUFFORCE, &socket_rcvbuf_size, sizeof(socket_rcvbuf_size)) == -1)
-    {
-        if (setsockopt(nfqc->nlsock_fd, SOL_SOCKET, SO_RCVBUF, &socket_rcvbuf_size, sizeof(socket_rcvbuf_size)) == -1)
-        {
-            SET_ERROR(modinst, "%s: Couldn't set receive buffer size on netlink socket to %u: %s (%d)",
-                    __func__, socket_rcvbuf_size, strerror(errno), errno);
-            goto fail;
-        }
-    }
-    if (nfqc->debug)
-        printf("Set socket receive buffer size to %u\n", socket_rcvbuf_size);
-
-    if (mnl_socket_bind(nfqc->nlsock, 0, MNL_SOCKET_AUTOPID) == -1)
-    {
-        SET_ERROR(modinst, "%s: Couldn't bind the netlink socket: %s (%d)",
-                __func__, strerror(errno), errno);
-        goto fail;
-    }
-    nfqc->portid = mnl_socket_get_portid(nfqc->nlsock);
-
-    struct nlmsghdr *nlh;
-
-    /* The following four packet family unbind/bind commands do nothing on modern (3.8+) kernels.
-        They used to handle binding the netfilter socket to a particular address family. */
-    nlh = nfq_build_cfg_command(nfqc->nlmsg_buf, AF_INET, NFQNL_CFG_CMD_PF_UNBIND, 0);
-    if (mnl_socket_sendto(nfqc->nlsock, nlh, nlh->nlmsg_len) == -1)
-    {
-        SET_ERROR(modinst, "%s: Couldn't unbind from NFQ for AF_INET: %s (%d)",
-                __func__, strerror(errno), errno);
-        goto fail;
-    }
-    nlh = nfq_build_cfg_command(nfqc->nlmsg_buf, AF_INET6, NFQNL_CFG_CMD_PF_UNBIND, 0);
-    if (mnl_socket_sendto(nfqc->nlsock, nlh, nlh->nlmsg_len) == -1)
-    {
-        SET_ERROR(modinst, "%s: Couldn't unbind from NFQ for AF_INET6: %s (%d)",
-                __func__, strerror(errno), errno);
-        goto fail;
-    }
-    nlh = nfq_build_cfg_command(nfqc->nlmsg_buf, AF_INET, NFQNL_CFG_CMD_PF_BIND, 0);
-    if (mnl_socket_sendto(nfqc->nlsock, nlh, nlh->nlmsg_len) == -1)
-    {
-        SET_ERROR(modinst, "%s: Couldn't bind to NFQ for AF_INET: %s (%d)",
-                __func__, strerror(errno), errno);
-        goto fail;
-    }
-    nlh = nfq_build_cfg_command(nfqc->nlmsg_buf, AF_INET6, NFQNL_CFG_CMD_PF_BIND, 0);
-    if (mnl_socket_sendto(nfqc->nlsock, nlh, nlh->nlmsg_len) == -1)
-    {
-        SET_ERROR(modinst, "%s: Couldn't bind to NFQ for AF_INET6: %s (%d)",
-                __func__, strerror(errno), errno);
-        goto fail;
-    }
-
-    /* Now, actually bind to the netfilter queue.  The address family specified is irrelevant. */
-    nlh = nfq_build_cfg_command(nfqc->nlmsg_buf, AF_UNSPEC, NFQNL_CFG_CMD_BIND, nfqc->queue_num);
-    if (mnl_socket_sendto(nfqc->nlsock, nlh, nlh->nlmsg_len) == -1)
-    {
-        SET_ERROR(modinst, "%s: Couldn't bind to NFQ queue %u: %s (%d)",
-                __func__, nfqc->queue_num, strerror(errno), errno);
-        goto fail;
-    }
-
-    /*
-     * Set the queue into packet copying mode with a max copying length of our snaplen.
-     * While we're building a configuration message, we might as well tack on our requested
-     * maximum queue length and enable delivery of packets that will be subject to GSO. That
-     * last bit means we'll potentially see packets larger than the device MTU prior to their
-     * trip through the segmentation offload path.  They'll probably show up as truncated.
-     */
-    nlh = nfq_build_cfg_params(nfqc->nlmsg_buf, NFQNL_COPY_PACKET, nfqc->snaplen, nfqc->queue_num);
-    mnl_attr_put_u32(nlh, NFQA_CFG_QUEUE_MAXLEN, htonl(nfqc->queue_maxlen));
-    mnl_attr_put_u32(nlh, NFQA_CFG_FLAGS, htonl(NFQA_CFG_F_GSO));
-    mnl_attr_put_u32(nlh, NFQA_CFG_MASK, htonl(NFQA_CFG_F_GSO));
-    if (nfqc->fail_open)
-    {
-        mnl_attr_put_u32(nlh, NFQA_CFG_FLAGS, htonl(NFQA_CFG_F_FAIL_OPEN));
-        mnl_attr_put_u32(nlh, NFQA_CFG_MASK, htonl(NFQA_CFG_F_FAIL_OPEN));
-    }
-    if (mnl_socket_sendto(nfqc->nlsock, nlh, nlh->nlmsg_len) == -1)
-    {
-        SET_ERROR(modinst, "%s: Couldn't configure NFQ parameters: %s (%d)",
-                __func__, strerror(errno), errno);
-        goto fail;
-    }
-
+    /* Initialize socket in thread so we can chang namespace, if provide */
+    pthread_t nlq_init_thread_id;
     int ret;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
+    void *res;
+    ret = pthread_create(&nlq_init_thread_id, NULL, &nlq_initialize, nfqc);
+    ret = pthread_join(nlq_init_thread_id,&res);
+    if (ret) {
+        printf("NFQ socket create failed, rc=%d\n", ret);
+        rval=DAQ_ERROR_NODEV;
+        goto fail;
+    }
+
+    if (*(int *)res < 0) {
+        printf("Error creating nfq socket, rc=%d\n", *(int *)res);
+        rval=DAQ_ERROR_NODEV;
+        goto fail;
+    }
 
     FIFOQueue *fifoq = calloc(2, sizeof(FIFOQueue));
     nfqc->rx_queue = fifoq;
@@ -626,7 +546,7 @@ static int nfq_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstan
     } else {
         printf("Create rx thread %lu\n", nfqc->rx_thread_id);
     }
-
+    sleep(1); // delay between thread starts...
     ret = pthread_create(&nfqc->tx_thread_id, NULL, &nlq_tx_enqueue, nfqc);
     if (ret != 0) {
         SET_ERROR(modinst, "%s: Couldn't create rx thread for NFQ queue %u: %s (%d)",
@@ -657,17 +577,35 @@ fail:
 static void nfq_daq_destroy(void *handle)
 {
     Nfq_Context_t *nfqc = (Nfq_Context_t *) handle;
+    void *res;
+    int ret;
 
     if (nfqc->nlsock)
         mnl_socket_close(nfqc->nlsock);
     if (nfqc->nlmsg_buf)
         free(nfqc->nlmsg_buf);
-#ifdef WLR_ADD_THREAD_DESTORY_BEFORE_CAN_FREE
+    pthread_cancel(nfqc->rx_thread_id);
+    pthread_cancel(nfqc->tx_thread_id);
+    ret = pthread_join(nfqc->rx_thread_id,&res);
+    if (!ret)
+        if (res == PTHREAD_CANCELED)
+            printf("main(): rx thread was canceled\n");
+        else
+            printf("main(): rx thread wasn't canceled (shouldn't happen!)\n");
+    else
+        printf("Join failed for rx thread\n");
+
+    ret = pthread_join(nfqc->tx_thread_id,&res);
+    if (!ret)
+        if (res == PTHREAD_CANCELED)
+            printf("main(): tx thread was canceled\n");
+        else
+            printf("main(): tx thread wasn't canceled (shouldn't happen!)\n");
+    else
+        printf("Join failed for tx thread\n");
+
     if (nfqc->rx_queue)
         free(nfqc->rx_queue);
-    if (nfqc->tx_queue)
-        free(nfqc->tx_queue);
-#endif
 
     destroy_packet_pool(nfqc);
     free(nfqc);
@@ -768,7 +706,7 @@ static int enqueue_desc(FIFOQueue *fifo, NfqPktDesc *desc)
     return 0;
 }
 
-static NfqPktDesc *rx_dequeue_desc(FIFOQueue *fifo)
+static NfqPktDesc *dequeue_desc(FIFOQueue *fifo)
 {
     if (!fifo) {
        return NULL;
@@ -822,19 +760,166 @@ static NfqPktDesc *get_free_desc(Nfq_Context_t *nfqc)
     return desc;
 }
 
+int nlq_ret=0;
+
+static void *nlq_initialize(void *data)
+{
+    Nfq_Context_t *nfqc = data;
+    if (nfqc->netns_path) {
+        int fd = open(nfqc->netns_path, O_RDONLY);
+        if (fd < 0) {
+            SET_ERROR(nfqc->modinst, "%s: Couldn't open network namespace: %s (%d)",
+                      __func__, strerror(errno), errno);
+            goto failrx;
+        } else {
+            nlq_ret = setns(fd, 0 /* CLONE_NEWNET */);
+            if (nlq_ret < 0) {
+                SET_ERROR(nfqc->modinst, "%s: Couldn't set network namespace for socket: %s (%d)",
+                          __func__, strerror(errno), errno);
+                goto failrx;
+            }
+        }
+     }
+    /* Open the netfilter netlink socket */
+    nfqc->nlsock = mnl_socket_open(NETLINK_NETFILTER);
+    if (!nfqc->nlsock)
+    {
+        SET_ERROR(nfqc->modinst, "%s: Couldn't open netfilter netlink socket: %s (%d)",
+                __func__, strerror(errno), errno);
+        goto failrx;
+    }
+    /* Cache the socket file descriptor for later use in the critical path for receive */
+    nfqc->nlsock_fd = mnl_socket_get_fd(nfqc->nlsock);
+
+    /* Implement the requested timeout by way of the receive timeout on the netlink socket */
+    if (nfqc->timeout)
+    {
+        struct timeval tv;
+        tv.tv_sec = nfqc->timeout / 1000;
+        tv.tv_usec = (nfqc->timeout % 1000) * 1000;
+        if (setsockopt(nfqc->nlsock_fd, SOL_SOCKET, SO_RCVTIMEO, (const void*)&tv, sizeof(tv)) == -1)
+        {
+            SET_ERROR(nfqc->modinst, "%s: Couldn't set receive timeout on netlink socket: %s (%d)",
+                    __func__, strerror(errno), errno);
+            goto failrx;
+        }
+    }
+
+    /* Set the socket receive buffer to something reasonable based on the desired queue and capture lengths.
+        Try with FORCE first to allow overriding the system's global rmem_max, then fall back on being limited
+        by it if that doesn't work.
+        The value will be doubled to allow room for bookkeeping overhead, so the default of 1024 * 1500 will
+        end up allocating about 3MB of receive buffer space.  The unmodified default tends to be around 208KB. */
+    unsigned int socket_rcvbuf_size = nfqc->queue_maxlen * nfqc->snaplen;
+    if (setsockopt(nfqc->nlsock_fd, SOL_SOCKET, SO_RCVBUFFORCE, &socket_rcvbuf_size, sizeof(socket_rcvbuf_size)) == -1)
+    {
+        if (setsockopt(nfqc->nlsock_fd, SOL_SOCKET, SO_RCVBUF, &socket_rcvbuf_size, sizeof(socket_rcvbuf_size)) == -1)
+        {
+            SET_ERROR(nfqc->modinst, "%s: Couldn't set receive buffer size on netlink socket to %u: %s (%d)",
+                    __func__, socket_rcvbuf_size, strerror(errno), errno);
+            goto failrx;
+        }
+    }
+    if (nfqc->debug)
+        printf("Set socket receive buffer size to %u\n", socket_rcvbuf_size);
+
+    if (mnl_socket_bind(nfqc->nlsock, 0, MNL_SOCKET_AUTOPID) == -1)
+    {
+        SET_ERROR(nfqc->modinst, "%s: Couldn't bind the netlink socket: %s (%d)",
+                __func__, strerror(errno), errno);
+        goto failrx;
+    }
+    nfqc->portid = mnl_socket_get_portid(nfqc->nlsock);
+
+    struct nlmsghdr *nlh;
+
+    /* The following four packet family unbind/bind commands do nothing on modern (3.8+) kernels.
+        They used to handle binding the netfilter socket to a particular address family. */
+    nlh = nfq_build_cfg_command(nfqc->nlmsg_buf, AF_INET, NFQNL_CFG_CMD_PF_UNBIND, 0);
+    if (mnl_socket_sendto(nfqc->nlsock, nlh, nlh->nlmsg_len) == -1)
+    {
+        SET_ERROR(nfqc->modinst, "%s: Couldn't unbind from NFQ for AF_INET: %s (%d)",
+                __func__, strerror(errno), errno);
+        goto failrx;
+    }
+    nlh = nfq_build_cfg_command(nfqc->nlmsg_buf, AF_INET6, NFQNL_CFG_CMD_PF_UNBIND, 0);
+    if (mnl_socket_sendto(nfqc->nlsock, nlh, nlh->nlmsg_len) == -1)
+    {
+        SET_ERROR(nfqc->modinst, "%s: Couldn't unbind from NFQ for AF_INET6: %s (%d)",
+                __func__, strerror(errno), errno);
+        goto failrx;
+    }
+    nlh = nfq_build_cfg_command(nfqc->nlmsg_buf, AF_INET, NFQNL_CFG_CMD_PF_BIND, 0);
+    if (mnl_socket_sendto(nfqc->nlsock, nlh, nlh->nlmsg_len) == -1)
+    {
+        SET_ERROR(nfqc->modinst, "%s: Couldn't bind to NFQ for AF_INET: %s (%d)",
+                __func__, strerror(errno), errno);
+        goto failrx;
+    }
+    nlh = nfq_build_cfg_command(nfqc->nlmsg_buf, AF_INET6, NFQNL_CFG_CMD_PF_BIND, 0);
+    if (mnl_socket_sendto(nfqc->nlsock, nlh, nlh->nlmsg_len) == -1)
+    {
+        SET_ERROR(nfqc->modinst, "%s: Couldn't bind to NFQ for AF_INET6: %s (%d)",
+                __func__, strerror(errno), errno);
+        goto failrx;
+    }
+
+    /* Now, actually bind to the netfilter queue.  The address family specified is irrelevant. */
+    nlh = nfq_build_cfg_command(nfqc->nlmsg_buf, AF_UNSPEC, NFQNL_CFG_CMD_BIND, nfqc->queue_num);
+    if (mnl_socket_sendto(nfqc->nlsock, nlh, nlh->nlmsg_len) == -1)
+    {
+        SET_ERROR(nfqc->modinst, "%s: Couldn't bind to NFQ queue %u: %s (%d)",
+                __func__, nfqc->queue_num, strerror(errno), errno);
+        goto failrx;
+    }
+
+    /*
+     * Set the queue into packet copying mode with a max copying length of our snaplen.
+     * While we're building a configuration message, we might as well tack on our requested
+     * maximum queue length and enable delivery of packets that will be subject to GSO. That
+     * last bit means we'll potentially see packets larger than the device MTU prior to their
+     * trip through the segmentation offload path.  They'll probably show up as truncated.
+     */
+    nlh = nfq_build_cfg_params(nfqc->nlmsg_buf, NFQNL_COPY_PACKET, nfqc->snaplen, nfqc->queue_num);
+    mnl_attr_put_u32(nlh, NFQA_CFG_QUEUE_MAXLEN, htonl(nfqc->queue_maxlen));
+    mnl_attr_put_u32(nlh, NFQA_CFG_FLAGS, htonl(NFQA_CFG_F_GSO));
+    mnl_attr_put_u32(nlh, NFQA_CFG_MASK, htonl(NFQA_CFG_F_GSO));
+    if (nfqc->fail_open)
+    {
+        mnl_attr_put_u32(nlh, NFQA_CFG_FLAGS, htonl(NFQA_CFG_F_FAIL_OPEN));
+        mnl_attr_put_u32(nlh, NFQA_CFG_MASK, htonl(NFQA_CFG_F_FAIL_OPEN));
+    }
+    if (mnl_socket_sendto(nfqc->nlsock, nlh, nlh->nlmsg_len) == -1)
+    {
+        SET_ERROR(nfqc->modinst, "%s: Couldn't configure NFQ parameters: %s (%d)",
+                __func__, strerror(errno), errno);
+        goto failrx;
+    }
+    return &nlq_ret;
+
+failrx:
+    printf("Exiting rx thread with error!\n");
+    nlq_ret = -3;
+    return &nlq_ret;
+}
+
+
 void *nlq_rx_enqueue(void *data) {
     Nfq_Context_t *nfqc = data;
     NfqPktDesc *desc = NULL;
     DAQ_RecvStatus rstat;
 
     printf("In the rx thread, queue %d\n", nfqc->queue_num);
-    while (!nfqc->interrupted) {
+    //while (!nfqc->interrupted) {
+    while (1) {
 
+        // If we still have a desciprtor, use it (means recv timed out)
         if (!desc) {
             desc = get_free_desc(nfqc);
             if (nfqc->debug)
                 printf("Got descriprior %p\n", desc);
             if (!desc) {
+                // WLR TODO: Count these?
                 usleep(500);
                 continue;
             }
@@ -843,8 +928,6 @@ void *nlq_rx_enqueue(void *data) {
         ssize_t ret = nl_socket_recv(nfqc, desc->nlmsg_buf, nfqc->nlmsg_bufsize, 1);
         if (ret < 0)
         {
-            if (nfqc->debug)
-                printf("Error from nl_socket_recv: %d %s\n", errno, strerror(errno));
             if (errno == ENOBUFS)
             {
                 nfqc->stats.hw_packets_dropped++;
@@ -865,8 +948,6 @@ void *nlq_rx_enqueue(void *data) {
             }
             continue;
         }
-        if (nfqc->debug)
-            printf("WLR: Process packet\n");
         errno = 0;
         ret = mnl_cb_run(desc->nlmsg_buf, ret, 0, nfqc->portid, process_message_cb, desc);
         if (ret < 0)
@@ -877,6 +958,8 @@ void *nlq_rx_enqueue(void *data) {
             continue;
         }
 
+        if (nfqc->debug)
+            printf("Process packet, length: %u\n", desc->msg.data_len);
 
         /* Increment the module instance's packet counter. */
         nfqc->stats.packets_received++;
@@ -884,17 +967,52 @@ void *nlq_rx_enqueue(void *data) {
         if (ret != 0) {
             printf("Error enqueueing pkt: %ld\n", ret);
         }
-        if (nfqc->debug)
-            printf("WLR: pkt enqueued %p\n", desc);
         desc = NULL;
     }
+
     printf("Exiting rx thread\n");
     return NULL;
+
 }
 
-void *nlq_tx_enqueue(void *data) {
+void *nlq_tx_enqueue(void *data)
+{
     Nfq_Context_t *nfqc = data;
-    printf("In the tx thread, queue %d\n", nfqc->queue_num);
+
+    while (1) {
+        NfqPktDesc *desc = dequeue_desc(nfqc->tx_queue);
+        if (!desc) {
+            usleep(5);
+            continue;
+        }
+        DAQ_Verdict verdict = desc->verdict;
+
+        /* Sanitize the verdict. */
+        if (verdict >= MAX_DAQ_VERDICT)
+            verdict = DAQ_VERDICT_PASS;
+        nfqc->stats.verdicts[verdict]++;
+        verdict = verdict_translation_table[verdict];
+
+        /* Send the verdict back to the kernel through netlink */
+        /* FIXIT-L Consider using an iovec for scatter/gather transmission with the new payload as a
+            separate entry. This would avoid a copy and potentially avoid buffer size restrictions.
+            Only as relevant as REPLACE is common. */
+        uint32_t plen = (verdict == DAQ_VERDICT_REPLACE) ? desc->msg.data_len : 0;
+        int nfq_verdict = (verdict == DAQ_VERDICT_PASS || verdict == DAQ_VERDICT_REPLACE) ? NF_ACCEPT : NF_DROP;;
+        struct nlmsghdr *nlh = nfq_build_verdict(nfqc->nlmsg_buf, ntohl(desc->nlph->packet_id), nfqc->queue_num,
+                nfq_verdict, plen, desc->msg.data);
+        if (mnl_socket_sendto(nfqc->nlsock, nlh, nlh->nlmsg_len) == -1)
+        {
+            SET_ERROR(nfqc->modinst, "%s: Couldn't send NFQ verdict: %s (%d)",
+                            __func__, strerror(errno), errno);
+            //return DAQ_ERROR;
+            continue;
+        }
+        // TODO Handle
+        put_free_desc(nfqc, desc);
+    }
+
+    printf("WLR: Done with tx thread %d\n", nfqc->interrupted);
     return NULL;
 }
 
@@ -903,6 +1021,9 @@ static unsigned nfq_daq_msg_receive(void *handle, const unsigned max_recv, const
 {
     Nfq_Context_t *nfqc = (Nfq_Context_t *) handle;
     unsigned idx = 0;
+    struct timeval start, now;
+
+    gettimeofday(&start, NULL);
 
     *rstat = DAQ_RSTAT_OK;
     while (idx < max_recv)
@@ -915,71 +1036,29 @@ static unsigned nfq_daq_msg_receive(void *handle, const unsigned max_recv, const
             break;
         }
 
-#ifdef WLR_NO_PTHREAD
-        /* Make sure that we have a packet descriptor available to populate. */
-        NfqPktDesc *desc = nfqc->pool.freelist;
-        if (!desc)
-        {
-            *rstat = DAQ_RSTAT_NOBUF;
-            break;
-        }
-
-        ssize_t ret = nl_socket_recv(nfqc, desc->nlmsg_buf, nfqc->nlmsg_bufsize, idx == 0);
-        if (ret < 0)
-        {
-            if (errno == ENOBUFS)
-            {
-                nfqc->stats.hw_packets_dropped++;
-                continue;
-            }
-            else if (errno == EAGAIN || errno == EWOULDBLOCK)
-                *rstat = (idx == 0) ? DAQ_RSTAT_TIMEOUT : DAQ_RSTAT_WOULD_BLOCK;
-            else if (errno == EINTR)
-            {
-                if (!nfqc->interrupted)
-                    continue;
-                nfqc->interrupted = false;
-                *rstat = DAQ_RSTAT_INTERRUPTED;
-            }
-            else
-            {
-                SET_ERROR(nfqc->modinst, "%s: Socket receive failed: %zd - %s (%d)",
-                        __func__, ret, strerror(errno), errno);
-                *rstat = DAQ_RSTAT_ERROR;
-            }
-            break;
-        }
-        errno = 0;
-        ret = mnl_cb_run(desc->nlmsg_buf, ret, 0, nfqc->portid, process_message_cb, desc);
-        if (ret < 0)
-        {
-            SET_ERROR(nfqc->modinst, "%s: Netlink message processing failed: %zd - %s (%d)",
-                    __func__, ret, strerror(errno), errno);
-            *rstat = DAQ_RSTAT_ERROR;
-            break;
-        }
-
-        /* Increment the module instance's packet counter. */
-        nfqc->stats.packets_received++;
-
-        /* Last, but not least, extract this descriptor from the free list and
-            place the message in the return vector. */
-        nfqc->pool.freelist = desc->next;
-        desc->next = NULL;
-        nfqc->pool.info.available--;
-#else // WLR_NO_PTHREADA
-        NfqPktDesc *desc = rx_dequeue_desc(nfqc->rx_queue);
-// WLR TODO: Add timeout or sleep loop here if idx = 0;
+        NfqPktDesc *desc = dequeue_desc(nfqc->rx_queue);
+// WLR TODO: Add timeout or sleep loop here if idx = 0; timestamp
         if (!desc) {
-            if (idx)
+            if (idx) {
                 return idx;
-            else
-                continue;
+            } else {
+                if (nfqc->timeout) {
+                    gettimeofday(&now, NULL);
+                    if (((now.tv_sec - start.tv_sec) * 1000 +
+                        (now.tv_usec - start.tv_usec) / 1000) > nfqc->timeout) {
+                          *rstat = DAQ_RSTAT_TIMEOUT;
+                 //       if (nfqc->debug)
+                   //         printf("Nothing recieve since timeout: %d\n", nfqc->timeout);
+                        goto err;
+                     }
+                    continue;
+                }
+            }
         }
         msgs[idx] = &desc->msg;
-#endif
         idx++;
     }
+err:
 
     return idx;
 }
@@ -990,6 +1069,11 @@ static int nfq_daq_msg_finalize(void *handle, const DAQ_Msg_t *msg, DAQ_Verdict 
     Nfq_Context_t *nfqc = (Nfq_Context_t *) handle;
     NfqPktDesc *desc = (NfqPktDesc *) msg->priv;
 
+    desc->verdict = verdict;
+    enqueue_desc(nfqc->tx_queue, desc);
+    return DAQ_SUCCESS;
+
+#ifdef WLR_OLD_WAY
     /* Sanitize the verdict. */
     if (verdict >= MAX_DAQ_VERDICT)
         verdict = DAQ_VERDICT_PASS;
@@ -1021,6 +1105,7 @@ static int nfq_daq_msg_finalize(void *handle, const DAQ_Msg_t *msg, DAQ_Verdict 
     nfqc->pool.info.available++;
 #endif
     return DAQ_SUCCESS;
+#endif // WLR_OLD_WAY
 }
 
 static int nfq_daq_get_msg_pool_info(void *handle, DAQ_MsgPoolInfo_t *info)
