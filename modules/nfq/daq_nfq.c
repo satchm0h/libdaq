@@ -22,7 +22,6 @@
 #include "config.h"
 #endif
 #define _GNU_SOURCE
-
 #include <arpa/inet.h>
 
 #include <errno.h>
@@ -81,8 +80,11 @@ typedef struct _fifo_queue
     int head;
     int tail;
     int count;
+    int inc;
     pthread_mutex_t queue_mutex;
+    pthread_cond_t queue_count;
     NfqPktDesc *desc_queue[DEFAULT_QUEUE_MAXLEN];
+    const char *name;
 } FIFOQueue;
 
 #define FIFO_ENQUEUE_FAILED -1
@@ -114,11 +116,9 @@ typedef struct _nfq_context
     pthread_mutex_t descr_mutex;
 
     pthread_t rx_thread_id;
-
     FIFOQueue *rx_queue;
 
     pthread_t tx_thread_id;
-    pthread_mutex_t tx_queue_mutex;
     FIFOQueue *tx_queue;
 } Nfq_Context_t;
 
@@ -143,7 +143,7 @@ static const DAQ_Verdict verdict_translation_table[MAX_DAQ_VERDICT] = {
 static DAQ_BaseAPI_t daq_base_api;
 
 void *nlq_rx_enqueue(void *data);
-void *nlq_tx_enqueue(void *data);
+void *nlq_tx_dequeue(void *data);
 static void *nlq_initialize(void *data);
 
 /*
@@ -535,8 +535,14 @@ static int nfq_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstan
     }
 
     FIFOQueue *fifoq = calloc(2, sizeof(FIFOQueue));
+    pthread_cond_init(&fifoq->queue_count, NULL);
+    fifoq->name = "RX";
+    fifoq->inc = 1;
     nfqc->rx_queue = fifoq;
     fifoq++;
+    pthread_cond_init(&fifoq->queue_count, NULL);
+    fifoq->name = "TX";
+    fifoq->inc = 1;
     nfqc->tx_queue = fifoq;
 
     ret = pthread_create(&nfqc->rx_thread_id, NULL, &nlq_rx_enqueue, nfqc);
@@ -547,7 +553,7 @@ static int nfq_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstan
         printf("Create rx thread %lu\n", nfqc->rx_thread_id);
     }
     sleep(1); // delay between thread starts...
-    ret = pthread_create(&nfqc->tx_thread_id, NULL, &nlq_tx_enqueue, nfqc);
+    ret = pthread_create(&nfqc->tx_thread_id, NULL, &nlq_tx_dequeue, nfqc);
     if (ret != 0) {
         SET_ERROR(modinst, "%s: Couldn't create rx thread for NFQ queue %u: %s (%d)",
                 __func__, nfqc->queue_num, strerror(ret), ret);
@@ -580,10 +586,14 @@ static void nfq_daq_destroy(void *handle)
     void *res;
     int ret;
 
+    if (nfqc->debug)
+        printf("%s: kill it all\n",__func__);
     if (nfqc->nlsock)
         mnl_socket_close(nfqc->nlsock);
     if (nfqc->nlmsg_buf)
         free(nfqc->nlmsg_buf);
+    pthread_cond_destroy(&nfqc->rx_queue->queue_count);
+    pthread_cond_destroy(&nfqc->tx_queue->queue_count);
     pthread_cancel(nfqc->rx_thread_id);
     pthread_cancel(nfqc->tx_thread_id);
     ret = pthread_join(nfqc->rx_thread_id,&res);
@@ -622,6 +632,8 @@ static int nfq_daq_interrupt(void *handle)
 {
     Nfq_Context_t *nfqc = (Nfq_Context_t *) handle;
 
+    if (nfqc->debug)
+        printf("%s: int\n", __func__);
     nfqc->interrupted = true;
 
     return DAQ_SUCCESS;
@@ -703,20 +715,39 @@ static int enqueue_desc(FIFOQueue *fifo, NfqPktDesc *desc)
     }
     fifo->count++;
     pthread_mutex_unlock(&fifo->queue_mutex);
+    pthread_cond_signal(&fifo->queue_count);
     return 0;
 }
 
-static NfqPktDesc *dequeue_desc(FIFOQueue *fifo)
+#define MAX_WAIT_TIME_IN_SECONDS (1)
+#define MAX_WAIT_IN_NSEC (8)
+//#define MAX_WAIT_IN_NSEC (80000)
+#define MAX_INC 1000000
+static NfqPktDesc *dequeue_desc(FIFOQueue *fifo, Nfq_Context_t *nfqc)
 {
     if (!fifo) {
        return NULL;
     }
 
+    struct timespec max_wait = {0, 0};
+    const int gettime_rv = clock_gettime(CLOCK_REALTIME, &max_wait);
+    max_wait.tv_nsec += MAX_WAIT_IN_NSEC*fifo->inc;
+
     pthread_mutex_lock(&fifo->queue_mutex);
     if (!fifo->count) {
+        pthread_cond_timedwait(&fifo->queue_count, &fifo->queue_mutex, &max_wait);
+    }
+    if (!fifo->count) {
         pthread_mutex_unlock(&fifo->queue_mutex);
+        if (fifo->inc < MAX_INC)
+            fifo->inc++;
         return NULL;
     }
+
+    fifo->inc=1;
+
+    if (nfqc->debug)
+        printf("%s: dequeue pkt, count: %d, inc: %d\n", fifo->name, fifo->count, fifo->inc);
 
     NfqPktDesc *desc = fifo->desc_queue[fifo->head];
     fifo->count--;
@@ -975,14 +1006,13 @@ void *nlq_rx_enqueue(void *data) {
 
 }
 
-void *nlq_tx_enqueue(void *data)
+void *nlq_tx_dequeue(void *data)
 {
     Nfq_Context_t *nfqc = data;
 
     while (1) {
-        NfqPktDesc *desc = dequeue_desc(nfqc->tx_queue);
+        NfqPktDesc *desc = dequeue_desc(nfqc->tx_queue, nfqc);
         if (!desc) {
-            usleep(5);
             continue;
         }
         DAQ_Verdict verdict = desc->verdict;
@@ -1016,6 +1046,7 @@ void *nlq_tx_enqueue(void *data)
     return NULL;
 }
 
+
 /* Module->msg_receive() */
 static unsigned nfq_daq_msg_receive(void *handle, const unsigned max_recv, const DAQ_Msg_t *msgs[], DAQ_RecvStatus *rstat)
 {
@@ -1036,8 +1067,7 @@ static unsigned nfq_daq_msg_receive(void *handle, const unsigned max_recv, const
             break;
         }
 
-        NfqPktDesc *desc = dequeue_desc(nfqc->rx_queue);
-// WLR TODO: Add timeout or sleep loop here if idx = 0; timestamp
+        NfqPktDesc *desc = dequeue_desc(nfqc->rx_queue, nfqc);
         if (!desc) {
             if (idx) {
                 return idx;
@@ -1046,10 +1076,10 @@ static unsigned nfq_daq_msg_receive(void *handle, const unsigned max_recv, const
                     gettimeofday(&now, NULL);
                     if (((now.tv_sec - start.tv_sec) * 1000 +
                         (now.tv_usec - start.tv_usec) / 1000) > nfqc->timeout) {
-                          *rstat = DAQ_RSTAT_TIMEOUT;
-                 //       if (nfqc->debug)
-                   //         printf("Nothing recieve since timeout: %d\n", nfqc->timeout);
-                        goto err;
+                         *rstat = DAQ_RSTAT_TIMEOUT;
+                        if (nfqc->debug)
+                            printf("timeout, rx inc: %d, tx inc: %d\n", nfqc->rx_queue->inc, nfqc->tx_queue->inc);
+                         goto err;
                      }
                     continue;
                 }
@@ -1059,7 +1089,6 @@ static unsigned nfq_daq_msg_receive(void *handle, const unsigned max_recv, const
         idx++;
     }
 err:
-
     return idx;
 }
 
