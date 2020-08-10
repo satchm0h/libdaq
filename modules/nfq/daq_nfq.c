@@ -46,7 +46,8 @@
 //
 #include "daq_dlt.h"
 #include "daq_module_api.h"
-
+#include <linux/if_packet.h>
+#include <net/if.h>
 /* FIXIT-M Need to figure out how to reimplement inject for NFQ */
 
 #define DAQ_NFQ_VERSION 8
@@ -95,6 +96,7 @@ typedef struct _fifo_queue
 typedef struct _nfq_context
 {
     /* Configuration */
+    char *device;
     unsigned queue_num;
     int snaplen;
     int timeout;
@@ -452,11 +454,13 @@ static int nfq_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstan
 
     char *endptr;
     errno = 0;
+    nfqc->device = strdup(daq_base_api.config_get_input(modcfg));
+    char *dev = nfqc->device;
     nfqc->queue_num = strtoul(daq_base_api.config_get_input(modcfg), &endptr, 10);
-    if (*endptr != '\0' || errno != 0)
+    if ((*endptr != '\0' && *endptr != ':') || errno != 0)
     {
-        SET_ERROR(modinst, "%s: Invalid queue number specified: '%s'",
-                __func__, daq_base_api.config_get_input(modcfg));
+        SET_ERROR(modinst, "%s: Invalid queue number specified: '%s', endptr: %c, queue: %d, errorstr: %s, error: %d",
+                __func__, daq_base_api.config_get_input(modcfg), *endptr, nfqc->queue_num, strerror(errno), errno);
         rval = DAQ_ERROR_INVAL;
         goto fail;
     }
@@ -550,9 +554,8 @@ static int nfq_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstan
         SET_ERROR(modinst, "%s: Couldn't create rx thread for NFQ queue %u: %s (%d)",
                 __func__, nfqc->queue_num, strerror(ret), ret);
     } else {
-        printf("Create rx thread %lu\n", nfqc->rx_thread_id);
+        printf("Create rx thread %lu, fd %d\n", nfqc->rx_thread_id, nfqc->nlsock_fd);
     }
-    sleep(1); // delay between thread starts...
     ret = pthread_create(&nfqc->tx_thread_id, NULL, &nlq_tx_dequeue, nfqc);
     if (ret != 0) {
         SET_ERROR(modinst, "%s: Couldn't create rx thread for NFQ queue %u: %s (%d)",
@@ -746,8 +749,8 @@ static NfqPktDesc *dequeue_desc(FIFOQueue *fifo, Nfq_Context_t *nfqc)
 
     fifo->inc=1;
 
-    if (nfqc->debug)
-        printf("%s: dequeue pkt, count: %d, inc: %d\n", fifo->name, fifo->count, fifo->inc);
+    //if (nfqc->debug)
+    //    printf("%s: dequeue pkt, count: %d, inc: %d\n", fifo->name, fifo->count, fifo->inc);
 
     NfqPktDesc *desc = fifo->desc_queue[fifo->head];
     fifo->count--;
@@ -789,6 +792,25 @@ static NfqPktDesc *get_free_desc(Nfq_Context_t *nfqc)
     pthread_mutex_unlock(&nfqc->descr_mutex);
 
     return desc;
+}
+
+static int configure_fanout(Nfq_Context_t *nfqc, int index /*, AFPacketInstance *instance */)
+{
+    int fanout_arg;
+    struct ifreq ifr;
+
+    /* Find the device index of the specified interface. */
+    memset(&ifr, 0, sizeof(ifr));//
+
+    printf("WLR: set fanout for fs %d, idx %d\n", nfqc->nlsock_fd, index);
+    fanout_arg = PACKET_FANOUT_HASH << 16 | index;
+    if (setsockopt(nfqc->nlsock_fd, SOL_SOCKET, PACKET_FANOUT, &fanout_arg, sizeof(fanout_arg)) == -1)
+    {
+        SET_ERROR(nfqc->modinst, "%s: Could not configure packet fanout: %s", __func__, strerror(errno));
+        return DAQ_ERROR;
+    }
+
+    return DAQ_SUCCESS;
 }
 
 int nlq_ret=0;
@@ -834,6 +856,13 @@ static void *nlq_initialize(void *data)
                     __func__, strerror(errno), errno);
             goto failrx;
         }
+    }
+    if (configure_fanout(nfqc, nfqc->nlsock) < 0)
+    {
+        printf("WLR: fanout error: %s, %d\n", strerror(errno), errno);
+            SET_ERROR(nfqc->modinst, "%s: Couldn't set fanout on netlink socket: %s (%d)",
+                    __func__, strerror(errno), errno);
+            goto failrx;
     }
 
     /* Set the socket receive buffer to something reasonable based on the desired queue and capture lengths.
@@ -947,9 +976,9 @@ void *nlq_rx_enqueue(void *data) {
         // If we still have a desciprtor, use it (means recv timed out)
         if (!desc) {
             desc = get_free_desc(nfqc);
-            if (nfqc->debug)
-                printf("Got descriprior %p\n", desc);
             if (!desc) {
+                if (nfqc->debug)
+                    printf("Out of descripriors!!!  Delay, retry...\n");
                 // WLR TODO: Count these?
                 usleep(500);
                 continue;

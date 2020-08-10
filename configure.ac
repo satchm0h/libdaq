@@ -10,7 +10,6 @@ m4_define([daq_version_str], [daq_major_version.daq_minor_version.daq_patch_vers
 # to the module directory of the same name.
 # TODO: Find the "right" way to escape this macro in arguments to m4 functions.
 m4_undefine([divert])
-
 AC_PREREQ([2.69])
 AC_INIT([daq],[daq_version_str],[snort-team@cisco.com])
 AC_CONFIG_MACRO_DIR([m4])
@@ -28,6 +27,7 @@ AC_PROG_CC_C99
 AC_PROG_CXX
 AM_PROG_AR
 AC_PROG_SED
+AM_PROG_AS
 
 AX_CXX_COMPILE_STDCXX_11(,optional)
 
@@ -232,6 +232,20 @@ fi
 AM_CONDITIONAL([BUILD_NFQ_MODULE], [test "$enable_nfq_module" = yes])
 AM_COND_IF([BUILD_NFQ_MODULE], [AC_CONFIG_FILES([modules/nfq/libdaq_static_nfq.pc])])
 
+# VIRTIO_TAP Module
+AC_ARG_ENABLE(virtio-tap-module,
+              AS_HELP_STRING([--disable-virtio-tap-module],[do not build the bundled VIRTIO_TAP module]),
+              [enable_virtio_tap_module="$enableval"], [enable_virtio_tap_module="$DEFAULT_ENABLE"])
+if test "$enable_virtio_tap_module" = yes; then
+    AC_CHECK_HEADERS([linux/netfilter.h linux/netfilter/nfnetlink_queue.h libmnl/libmnl.h], [], [enable_virtio_tap_module=no])
+    AC_CHECK_LIB([mnl], [mnl_socket_open], [], [enable_virtio_tap_module=no])
+    if test "$enable_virtio_tap_module" = yes; then
+        DAQ_VIRTIO_TAP_LIBS="-lpthread -lrt -ldl"
+    fi
+fi
+AM_CONDITIONAL([BUILD_VIRTIO_TAP_MODULE], [test "$enable_virtio_tap_module" = yes])
+AM_COND_IF([BUILD_VIRTIO_TAP_MODULE], [AC_CONFIG_FILES([modules/virtio_tap/libdaq_static_virtio_tap.pc])])
+
 # PCAP Module
 AC_ARG_ENABLE(pcap-module,
               AS_HELP_STRING([--disable-pcap-module],[do not build the bundled PCAP module]),
@@ -262,6 +276,7 @@ AM_CONDITIONAL([BUILD_MODULES], [test "$enable_afpacket_module" = yes -o \
                                       "$enable_dump_module" = yes -o \
                                       "$enable_fst_module" = yes -o \
                                       "$enable_nfq_module" = yes -o \
+                                      "$enable_virtio_tap_module" = yes -o \
                                       "$enable_pcap_module" = yes -o \
                                       "$enable_trace_module" = yes])
 
@@ -304,6 +319,7 @@ AC_SUBST(DAQ_BPF_LIBS)
 AC_SUBST(DAQ_DUMP_LIBS)
 AC_SUBST(DAQ_FST_LIBS)
 AC_SUBST(DAQ_NFQ_LIBS)
+AC_SUBST(DAQ_VIRTIO_TAP_LIBS)
 AC_SUBST(DAQ_PCAP_LIBS)
 
 if test "${CODE_COVERAGE_ENABLED}" = yes ; then
@@ -342,13 +358,14 @@ AC_MSG_RESULT([
     code_coverage_cflags:   ${CODE_COVERAGE_CFLAGS}
     code_coverage_ldflags:  ${CODE_COVERAGE_LDFLAGS}
 
-    Build AFPacket DAQ module.. : $enable_afpacket_module
-    Build BPF DAQ module....... : $enable_bpf_module
-    Build Divert DAQ module.... : $enable_divert_module
-    Build Dump DAQ module...... : $enable_dump_module
-    Build FST DAQ module....... : $enable_fst_module
-    Build NFQ DAQ module....... : $enable_nfq_module
-    Build PCAP DAQ module...... : $enable_pcap_module
-    Build netmap DAQ module.... : $enable_netmap_module
-    Build Trace DAQ module..... : $enable_trace_module
+    Build AFPacket DAQ module.... : $enable_afpacket_module
+    Build BPF DAQ module......... : $enable_bpf_module
+    Build Divert DAQ module...... : $enable_divert_module
+    Build Dump DAQ module........ : $enable_dump_module
+    Build FST DAQ module......... : $enable_fst_module
+    Build NFQ DAQ module......... : $enable_nfq_module
+    Build VIRTIO_TAP DAQ module.. : $enable_virtio_tap_module
+    Build PCAP DAQ module........ : $enable_pcap_module
+    Build netmap DAQ module...... : $enable_netmap_module
+    Build Trace DAQ module....... : $enable_trace_module
 ])
