@@ -98,7 +98,7 @@ typedef struct
   int host_mtu_size;
 } tap_main_t;
 
-void tap_create_if (vlib_main_t * vm, tap_create_if_args_t * args);
+virtio_if_t *tap_create_if (vlib_main_t * vm, tap_create_if_args_t * args);
 int tap_delete_if (vlib_main_t * vm, u32 sw_if_index);
 int tap_gso_enable_disable (vlib_main_t * vm, u32 sw_if_index,
 			    int enable_disable);

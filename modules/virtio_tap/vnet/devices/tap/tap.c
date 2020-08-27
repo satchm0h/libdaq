@@ -129,7 +129,7 @@ error:
   pool_put (mm->interfaces, vif);
 }
 
-void
+virtio_if_t *
 tap_create_if (vlib_main_t * vm, tap_create_if_args_t * args)
 {
   vlib_thread_main_t *thm = vlib_get_thread_main ();
@@ -159,7 +159,7 @@ tap_create_if (vlib_main_t * vm, tap_create_if_args_t * args)
 	{
 	  args->rv = VNET_API_ERROR_INVALID_INTERFACE;
 	  args->error = clib_error_return (0, "interface already exists");
-	  return;
+	  return NULL;
 	}
     }
   else
@@ -171,7 +171,7 @@ tap_create_if (vlib_main_t * vm, tap_create_if_args_t * args)
     {
       args->rv = VNET_API_ERROR_UNSPECIFIED;
       args->error = clib_error_return (0, "cannot find free interface id");
-      return;
+      return NULL;
     }
 
   pool_get_zero (vim->interfaces, vif);
@@ -737,14 +737,16 @@ tap_create_if (vlib_main_t * vm, tap_create_if_args_t * args)
   vnet_hw_interface_set_input_node (vnm, vif->hw_if_index,
 				    virtio_input_node.index);
 
+#endif WLR_SKIP
   for (i = 0; i < vif->num_rxqs; i++)
     {
+#ifdef WLR_SKIP
       vnet_hw_interface_assign_rx_thread (vnm, vif->hw_if_index, i, ~0);
       vnet_hw_interface_set_rx_mode (vnm, vif->hw_if_index, i,
 				     VNET_HW_INTERFACE_RX_MODE_DEFAULT);
+#endif WLR_SKIP
       virtio_vring_set_numa_node (vm, vif, RX_QUEUE (i));
     }
-#endif WLR_SKIP
 
   vif->per_interface_next_index = ~0;
   vif->flags |= VIRTIO_IF_FLAG_ADMIN_UP;
@@ -763,7 +765,7 @@ error:
       args->error = err;
       args->rv = VNET_API_ERROR_SYSCALL_ERROR_3;
     }
-
+    printf("WLR: we erorrored out!!!!!\n");
   tap_log_err (vif, "%U", format_clib_error, args->error);
   tap_free (vm, vif);
 done:
@@ -773,6 +775,7 @@ done:
     close (old_netns_fd);
   if (nfd != -1)
     close (nfd);
+  return vif;
 }
 
 int

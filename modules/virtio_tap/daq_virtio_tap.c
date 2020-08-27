@@ -20,6 +20,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
+#include <sys/epoll.h>
 
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
@@ -32,8 +34,8 @@
 #include <vnet/ip/ip4_packet.h>
 #include <vnet/ip/ip6_packet.h>
 #include <vnet/devices/netlink.h>
-#include <vnet/devices/tap/tap.h>
 #include <vnet/devices/virtio/virtio.h>
+#include <vnet/devices/tap/tap.h>
 // WLR: above includes from tap.c in vpp
 
 #include "daq_dlt.h"
@@ -113,6 +115,11 @@ typedef struct _virtio_tap_msg_pool
     DAQ_MsgPoolInfo_t info;
 } VirtioTapMsgPool;
 
+typedef struct
+{
+    int epoll_fd;
+} virtio_tap_main_t;
+
 typedef struct _virtio_tap_context
 {
     /* Configuration */
@@ -124,18 +131,20 @@ typedef struct _virtio_tap_context
     //VirtioTapFanoutCfg fanout_cfg;
     bool use_tx_ring;
     bool debug;
+    int epoll_fd;
     /* State */
     DAQ_ModuleInstance_h modinst;
     VirtioTapMsgPool pool;
     VirtioTapInstance *instances;
     uint32_t intf_count;
-
+    virtio_tap_main_t viotm;
     volatile bool interrupted;
     DAQ_Stats_t stats;
     /* Message receive state */
     VirtioTapInstance *curr_instance;
 } VirtioTap_Context_t;
 
+#ifdef WLR_USE_VPP_NOW
 typedef struct
 {
   u8 *data;
@@ -150,7 +159,6 @@ typedef struct
  * prototypes
  */
 
-#ifdef WLR_USE_VPP_NOW
 static clib_error_t *clib_error_return_unix(int rc, const char *str)
 {
     clib_error_t *err = malloc(sizeof(clib_error_t));
@@ -245,14 +253,14 @@ static int virtio_tap_daq_get_variable_descs(const DAQ_VariableDesc_t **var_desc
 }
 
 
-static int create_packet_pool(VirtioTap_Context_t *afpc, unsigned size)
+static int create_packet_pool(VirtioTap_Context_t *viotc, unsigned size)
 {
-    VirtioTapMsgPool *pool = &afpc->pool;
-    printf("WLR: %s: size=%u, snap %u\n", __func__, size, afpc->instances->actual_snaplen);
+    VirtioTapMsgPool *pool = &viotc->pool;
+    printf("WLR: %s: size=%u, snap %u\n", __func__, size, viotc->instances->actual_snaplen);
     pool->pool = calloc(sizeof(VirtioTapPktDesc), size);
     if (!pool->pool)
     {
-        SET_ERROR(afpc->modinst, "%s: Could not allocate %zu bytes for a packet descriptor pool!",
+        SET_ERROR(viotc->modinst, "%s: Could not allocate %zu bytes for a packet descriptor pool!",
                 __func__, sizeof(VirtioTapPktDesc) * size);
         return DAQ_ERROR_NOMEM;
     }
@@ -261,14 +269,14 @@ static int create_packet_pool(VirtioTap_Context_t *afpc, unsigned size)
     {
         /* Allocate packet data and set up descriptor */
         VirtioTapPktDesc *desc = &pool->pool[pool->info.size];
-        desc->data = malloc(afpc->instances->actual_snaplen);
+        desc->data = malloc(viotc->instances->actual_snaplen);
         if (!desc->data)
         {
-            SET_ERROR(afpc->modinst, "%s: Could not allocate %d bytes for a packet descriptor message buffer!",
-                    __func__, afpc->instances->actual_snaplen);
+            SET_ERROR(viotc->modinst, "%s: Could not allocate %d bytes for a packet descriptor message buffer!",
+                    __func__, viotc->instances->actual_snaplen);
             return DAQ_ERROR_NOMEM;
         }
-        pool->info.mem_size += afpc->instances->actual_snaplen;
+        pool->info.mem_size += viotc->instances->actual_snaplen;
 
         /* Initialize non-zero invariant packet header fields. */
         DAQ_PktHdr_t *pkthdr = &desc->pkthdr;
@@ -281,7 +289,7 @@ static int create_packet_pool(VirtioTap_Context_t *afpc, unsigned size)
         msg->hdr_len = sizeof(desc->pkthdr);
         msg->hdr = &desc->pkthdr;
         msg->data = desc->data;
-        msg->owner = afpc->modinst;
+        msg->owner = viotc->modinst;
         msg->priv = desc;
 
         /* Place it on the free list */
@@ -299,7 +307,7 @@ static int create_packet_pool(VirtioTap_Context_t *afpc, unsigned size)
 #define IF_TAP 0
 #define IF_TUN 1
 #ifdef WLR_USE_VPP
-static int virtio_create_tap_interface(VirtioTap_Context_t *afpc, VirtioTapInstance *instance)
+static int virtio_create_tap_interface(VirtioTap_Context_t *viotc, VirtioTapInstance *instance)
 {
     int nsfd;
     int tfd;
@@ -563,21 +571,33 @@ static int virtio_create_tap_interface(VirtioTap_Context_t *afpc, VirtioTapInsta
     return DAQ_SUCCESS;
 }
 #endif // WLR_USE_VPP
+static int virto_add_epoll_fd(VirtioTapInstance *instance, VirtioTap_Context_t *viotc)
+{
+    int rc = 0;
+    struct epoll_event e = { 0 };
+    e.events = EPOLLIN;
+    e.data.u32 = instance->ifindex;
 
-static VirtioTapInstance *create_instance(VirtioTap_Context_t *afpc, const char *device, const char *namespace)
+    rc = epoll_ctl(viotc->epoll_fd, EPOLL_CTL_ADD, instance->vif->rxq_vrings[0].call_fd, &e);
+    return rc;
+}
+
+static VirtioTapInstance *create_instance(VirtioTap_Context_t *viotc, const char *device, const char *namespace)
 {
     VirtioTapInstance *instance = NULL;
     struct ifreq ifr;
     socklen_t len;
     tap_create_if_args_t tapd;
+    virtio_if_t *vif;
     //int val;
 
+    printf("WLR: %s\n", __func__);
     memset(&tapd,0, sizeof(tap_create_if_args_t));
     tapd.id = ~0;
     instance = calloc(1, sizeof(VirtioTapInstance));
     if (!instance)
     {
-        SET_ERROR(afpc->modinst, "%s: Could not allocate a new instance structure.", __func__);
+        SET_ERROR(viotc->modinst, "%s: Could not allocate a new instance structure.", __func__);
         goto err;
     }
 
@@ -590,38 +610,48 @@ static VirtioTapInstance *create_instance(VirtioTap_Context_t *afpc, const char 
     tapd.num_rx_queues = instance->rx_queues;
     if ((instance->name = strdup(device)) == NULL)
     {
-        SET_ERROR(afpc->modinst, "%s: Could not allocate a copy of the device name.", __func__);
+        SET_ERROR(viotc->modinst, "%s: Could not allocate a copy of the device name.", __func__);
         goto err;
     }
     tapd.host_if_name = instance->name;
     if (*namespace == '/')
         if ((instance->namespace = strdup(namespace)) == NULL)
         {
-            SET_ERROR(afpc->modinst, "%s: Could not allocate a copy of the device name.", __func__);
+            SET_ERROR(viotc->modinst, "%s: Could not allocate a copy of the device name.", __func__);
             goto err;
         }
     tapd.host_namespace = instance->namespace;
-    instance->actual_snaplen = afpc->snaplen; // WLR FIXME
-
+    instance->actual_snaplen = viotc->snaplen; // WLR FIXME
+//
     vlib_main_t * vm = vlib_get_main();
     instance->vm = vm;
-    tap_create_if(vm, &tapd);
+    vif = tap_create_if(vm, &tapd);
+
+    printf("WLR: VIF %p VRING: %p size %d\n", vif, vif->rxq_vrings, sizeof(virtio_if_t));
+    virtio_if_t *vif2 = malloc(sizeof(virtio_if_t));
+    memcpy(vif2,vif,sizeof(virtio_if_t));
+    instance->vif = vif2;
     if (tapd.rv) {
-        printf("WLR: Tap creat failed, rv %d, if idx %u, if name %s\n", tapd.rv, tapd.sw_if_index, tapd.host_if_name);
+        printf("WLR: Tap create failed, rv %d, if idx %u, if name %s\n", tapd.rv, tapd.sw_if_index, tapd.host_if_name);
         return NULL;
     }
+
+    printf("WLR: virto_add_epoll_fd\n");
+    virto_add_epoll_fd(instance,viotc);
+
 #ifdef WLR_SKIP
-    if (virtio_create_tap_interface(afpc, instance)) {
-        SET_ERROR(afpc->modinst, "%s: Couldn't create tap device!", __func__);
+    if (virtio_create_tap_interface(viotc, instance)) {
+        SET_ERROR(viotc->modinst, "%s: Couldn't create tap device!", __func__);
         return(NULL);
     }
 #endif // WLR_SKIP
-    if (afpc->debug)
+    if (viotc->debug)
     {
         printf("[%s]\n", instance->name);
+#ifdef WLR_SKIP
         printf("  Namespace: %s\n", instance->namespace);
         printf("  Snaplen: %u\n", instance->actual_snaplen);
-#ifdef WLR_SKIP
+
         printf("  TPacket Version: %u\n", instance->tp_version);
         printf("  TPacket Header Length: %u\n", instance->tp_hdrlen);
         printf("  MTU: %d\n", instance->mtu);
@@ -636,12 +666,12 @@ err:
     return NULL;
 }
 
-static int create_bridge(VirtioTap_Context_t *afpc, const char *device_name1, const char *device_name2)
+static int create_bridge(VirtioTap_Context_t *viotc, const char *device_name1, const char *device_name2)
 {
     VirtioTapInstance *instance, *peer1, *peer2;
 
     peer1 = peer2 = NULL;
-    for (instance = afpc->instances; instance; instance = instance->next)
+    for (instance = viotc->instances; instance; instance = instance->next)
     {
         if (!strcmp(instance->name, device_name1))
             peer1 = instance;
@@ -655,16 +685,16 @@ static int create_bridge(VirtioTap_Context_t *afpc, const char *device_name1, co
     peer1->peer = peer2;
     peer2->peer = peer1;
 
-    if (afpc->debug) {
+    if (viotc->debug) {
         printf("Setting up peers %s:%s\n",device_name1, device_name2);
     }
     return DAQ_SUCCESS;
 }
 
 #define NS_SIZE 128
-static int create_interfaces(VirtioTap_Context_t *afpc, const DAQ_ModuleConfig_h modcfg)
+static int create_interfaces(VirtioTap_Context_t *viotc, const DAQ_ModuleConfig_h modcfg)
 {
-    char *dev =  afpc->device;
+    char *dev =  viotc->device;
     char *name1, *name2;
     int num_intfs = 0;
     char intf[IFNAMSIZ];
@@ -672,7 +702,7 @@ static int create_interfaces(VirtioTap_Context_t *afpc, const DAQ_ModuleConfig_h
     VirtioTapInstance *afi;
     char *netns = malloc(NS_SIZE);
     if (!netns) {
-        SET_ERROR(afpc->modinst, "%s: unabble to malloc netns (%d)", __func__, errno);
+        SET_ERROR(viotc->modinst, "%s: unabble to malloc netns (%d)", __func__, errno);
         goto iferr;
     }
 
@@ -681,16 +711,16 @@ static int create_interfaces(VirtioTap_Context_t *afpc, const DAQ_ModuleConfig_h
         len = strcspn(dev, ":");
         if (len >= IFNAMSIZ)
         {
-            SET_ERROR(afpc->modinst, "%s: Interface name too long! (%zu)", __func__, len);
+            SET_ERROR(viotc->modinst, "%s: Interface name too long! (%zu)", __func__, len);
 
             goto iferr;
         }
         if (len != 0)
         {
-            afpc->intf_count++;
-            if (afpc->intf_count >= AF_PACKET_MAX_INTERFACES)
+            viotc->intf_count++;
+            if (viotc->intf_count >= AF_PACKET_MAX_INTERFACES)
             {
-                SET_ERROR(afpc->modinst, "%s: Using more than %d interfaces is not supported!", __func__, AF_PACKET_MAX_INTERFACES);
+                SET_ERROR(viotc->modinst, "%s: Using more than %d interfaces is not supported!", __func__, AF_PACKET_MAX_INTERFACES);
                 goto iferr;
             }
             snprintf(intf, len + 1, "%s", dev);
@@ -703,29 +733,29 @@ static int create_interfaces(VirtioTap_Context_t *afpc, const DAQ_ModuleConfig_h
                 {
                     if (len >= NS_SIZE)
                     {
-                        SET_ERROR(afpc->modinst, "%s: Interface name too long! (%zu %zu)", __func__, len, IFNAMSIZ);
+                        SET_ERROR(viotc->modinst, "%s: Interface name too long! (%zu %zu)", __func__, len, IFNAMSIZ);
 
                         goto iferr;
                     }
                     snprintf(netns, len + 1, "%s", dev);
                 }
             }
-            afi = create_instance(afpc, intf, netns);
+            afi = create_instance(viotc, intf, netns);
             if (!afi)
                 goto iferr;
-
-            afi->next = afpc->instances;
-            afpc->instances = afi;
+            printf("Back from create_instance(), afi: %p\n", afi);
+            afi->next = viotc->instances;
+            viotc->instances = afi;
             num_intfs++;
             if (daq_base_api.config_get_mode(modcfg) != DAQ_MODE_PASSIVE)
             {
                 if (num_intfs == 2)
                 {
-                    name1 = afpc->instances->next->name;
-                    name2 = afpc->instances->name;
-                    if (create_bridge(afpc, name1, name2) != DAQ_SUCCESS)
+                    name1 = viotc->instances->next->name;
+                    name2 = viotc->instances->name;
+                    if (create_bridge(viotc, name1, name2) != DAQ_SUCCESS)
                     {
-                        SET_ERROR(afpc->modinst, "%s: Couldn't create the bridge between %s and %s!", __func__, name1, name2);
+                        SET_ERROR(viotc->modinst, "%s: Couldn't create the bridge between %s and %s!", __func__, name1, name2);
                         goto iferr;
                     }
                     num_intfs = 0;
@@ -746,14 +776,14 @@ iferr:
     return DAQ_ERROR;
 }
 
-static int daq_parse_options(const DAQ_ModuleConfig_h modcfg, VirtioTap_Context_t *afpc)
+static int daq_parse_options(const DAQ_ModuleConfig_h modcfg, VirtioTap_Context_t *viotc)
 {
     const char *varKey, *varValue;
     daq_base_api.config_first_variable(modcfg, &varKey, &varValue);
     while (varKey)
     {
         if (!strcmp(varKey, "debug")) {
-            afpc->debug = true;
+            viotc->debug = true;
         }
 
         daq_base_api.config_next_variable(modcfg, &varKey, &varValue);
@@ -765,16 +795,18 @@ static int virtio_tap_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_Modul
 {
 
     VirtioTapInstance *afi;
-    VirtioTap_Context_t *afpc;
+    VirtioTap_Context_t *viotc;
     int rval = DAQ_ERROR;
     clib_error_t *err;
     vlib_main_t *vm = &vlib_global_main;  /* one and only time for this! */
+    virtio_tap_main_t *vtm;
 
     //clib_mem_init (0, 64ULL << 10);
     clib_mem_init_thread_safe (0, 128 << 20);
     clib_time_init (&vm->clib_time);
     unix_main_init(vm);
     virtio_main.log_default = VLIB_LOG_LEVEL_DEBUG;
+
     err = linux_epoll_input_init(vm);
     if (err && err->code) {
         printf("Error from linux_epoll_input_init(), rc=%d, what=%s, where=%s\n", err->code, err->what, err->where);
@@ -786,6 +818,8 @@ static int virtio_tap_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_Modul
         return rval;
     }
     virtio_main.log_default = VLIB_LOG_LEVEL_DEBUG;
+
+
 #ifdef WLR_SKIP
     err = vnet_main_init(vm);
     if (err && err->code) {
@@ -798,6 +832,13 @@ static int virtio_tap_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_Modul
         printf("Error from vlib_map_stat_segment_init:(), rc=%d, what=%s, where=%s\n", err->code, err->what, err->where);
         return rval;
     }
+
+    err = vlib_buffer_main_init(vm);
+    if (err && err->code) {
+        printf("Error from vlib_buffer_main_init(), rc=%d, what=%s, where=%s\n", err->code, err->what, err->where);
+        return rval;
+    }
+
     vec_validate(vlib_thread_stacks, 0);
     vlib_thread_stack_init (0);
     err = vlib_thread_init (vm);
@@ -811,28 +852,37 @@ static int virtio_tap_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_Modul
         return rval;
     }
     printf("%s():\n", __func__);
-    afpc = calloc(1, sizeof(VirtioTap_Context_t));
-    if (!afpc)
+    viotc = calloc(1, sizeof(VirtioTap_Context_t));
+    if (!viotc)
     {
         SET_ERROR(modinst, "%s: Couldn't allocate memory for the new VirtioTap context!", __func__);
         return(DAQ_ERROR_NOMEM);
     }
-    afpc->modinst = modinst;
+    viotc->modinst = modinst;
 
-    afpc->device = strdup(daq_base_api.config_get_input(modcfg));
-    if (!afpc->device)
+    /* TODO: May need mutex lock here?? */
+    vtm = &viotc->viotm;
+    vtm->epoll_fd = epoll_create (1);
+    if (vtm->epoll_fd < 0)
+    {
+        printf("Error creating epoll, %s(%d)\n", strerror(vtm->epoll_fd), vtm->epoll_fd);
+        return rval;
+    }
+
+    viotc->device = strdup(daq_base_api.config_get_input(modcfg));
+    if (!viotc->device)
     {
         SET_ERROR(modinst, "%s: Couldn't allocate memory for the device string!", __func__);
         return(DAQ_ERROR_NOMEM);
     }
 
-    afpc->snaplen = daq_base_api.config_get_snaplen(modcfg);
-    afpc->timeout = (int) daq_base_api.config_get_timeout(modcfg);
-    rval = daq_parse_options(modcfg, afpc);
+    viotc->snaplen = daq_base_api.config_get_snaplen(modcfg);
+    viotc->timeout = (int) daq_base_api.config_get_timeout(modcfg);
+    rval = daq_parse_options(modcfg, viotc);
     if (rval)
         return (rval);
 
-    if (create_interfaces(afpc,modcfg)) {
+    if (create_interfaces(viotc,modcfg)) {
         //SET_ERROR(modinst, "%s: Couldn't create tap device!", __func__);
         return(DAQ_ERROR_NODEV);
     }
@@ -842,22 +892,22 @@ static int virtio_tap_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_Modul
     if (pool_size == 0)
     {
         /* Default the pool size to 10% of the allocated RX frames. */
-        for (afi = afpc->instances; afi; afi = afi->next) {
+        for (afi = viotc->instances; afi; afi = afi->next) {
             pool_size += 512;// WLR FIXMIE
-            afi->actual_snaplen = afpc->snaplen; // WLR FIXME
+            afi->actual_snaplen = viotc->snaplen; // WLR FIXME
         }
             //pool_size += afi->rx_ring.layout.tp_frame_nr;
         pool_size /= 10;
     }
-    if (afpc->debug) {
+    if (viotc->debug) {
         printf("       snaplen = %d\n       timeout = %d\n     pool size = %d\n",
-                afpc->snaplen, afpc->timeout, pool_size);
+                viotc->snaplen, viotc->timeout, pool_size);
     }
 
-    if ((rval = create_packet_pool(afpc, pool_size)) != DAQ_SUCCESS)
+    if ((rval = create_packet_pool(viotc, pool_size)) != DAQ_SUCCESS)
         goto err;
 
-    *ctxt_ptr = afpc;
+    *ctxt_ptr = viotc;
     return DAQ_SUCCESS;
 
 err:
@@ -945,34 +995,133 @@ static uint32_t virtio_tap_daq_get_capabilities(void *handle)
 static int virtio_tap_daq_get_datalink_type(void *handle)
 {
     printf("%s():\n", __func__);
-    return DLT_RAW; // nlq.  What should it be?
-    //return DLT_EN10MB; afpacket
+    return DLT_EN10MB;
+}
+
+static inline DAQ_RecvStatus wait_for_packet(VirtioTap_Context_t *viotc)
+{
+    VirtioTapInstance *instance;
+//    struct pollfd pfd[AF_PACKET_MAX_INTERFACES];
+    uint32_t i;
+    printf("%s(): nun instances %d\n", __func__, viotc->intf_count);
+    virtio_if_t *vif;
+    virtio_vring_t *vring;
+    struct vring_used *used;
+    int n_fds_ready;
+    struct epoll_event events[AF_PACKET_MAX_INTERFACES];
+    static sigset_t unblock_all_signals;
+
+
+    for (i = 0, instance = viotc->instances; instance; i++, instance = instance->next)
+    {
+        vif = instance->vif;
+        vring = vec_elt_at_index (vif->rxq_vrings, RX_QUEUE_ACCESS(0));
+        events[i].events = EPOLLIN;
+        events[i].data.u32 = vring->call_fd;
+        used = vif->rxq_vrings[0].used;
+        printf("idx %d VIF %p, vring %p, call_fd %d, used: %d", i, vif, vif->rxq_vrings, vring->call_fd, used->idx);
+//        printf("call_fd(%d): %p:%p  %d ", i, vring, vif->rxq_vrings, vring->call_fd);
+#ifdef WLR_SKIP
+        pfd[i].fd = vring->call_fd;
+        pfd[i].revents = 0;
+        pfd[i].events = POLLIN;
+#endif
+    }
+    printf("\n");
+    /* Chop the timeout into one second chunks (plus any remainer) to improve responsiveness to
+        interruption when there is no traffic and the timeout is very long (or unlimited). */
+    int timeout = viotc->timeout;
+    while (timeout != 0)
+    {
+        /* If the receive has been canceled, break out of the loop and return. */
+        if (viotc->interrupted)
+        {
+            viotc->interrupted = false;
+            return DAQ_RSTAT_INTERRUPTED;
+        }
+
+        int poll_timeout;
+        if (timeout >= 1000)
+        {
+            poll_timeout = 1000;
+            timeout -= 1000;
+        }
+        else if (timeout > 0)
+        {
+            poll_timeout = timeout;
+            timeout = 0;
+        }
+        else
+            poll_timeout = 1000;
+
+        n_fds_ready = epoll_pwait(viotc->viotm.epoll_fd, &events, viotc->intf_count, poll_timeout, &unblock_all_signals);
+        printf("WLR: n_fds_ready=%d\n", n_fds_ready);
+        if (n_fds_ready > 0)
+        {
+            printf("WLR: got one!\n");
+            exit(1);
+        }
+#ifdef WLR_SKIP
+        //int ret = poll(pfd, viotc->intf_count, poll_timeout);
+        /* If some number of of sockets have events returned, check them all for badness. */
+        if (ret > 0)
+        {
+            for (i = 0; i < viotc->intf_count; i++)
+            {
+                if (pfd[i].revents & (POLLHUP | POLLRDHUP | POLLERR | POLLNVAL))
+                {
+                    if (pfd[i].revents & (POLLHUP | POLLRDHUP))
+                        SET_ERROR(viotc->modinst, "%s: Hang-up on a packet socket", __func__);
+                    else if (pfd[i].revents & POLLERR)
+                        SET_ERROR(viotc->modinst, "%s: Encountered error condition on a packet socket", __func__);
+                    else if (pfd[i].revents & POLLNVAL)
+                        SET_ERROR(viotc->modinst, "%s: Invalid polling request on a packet socket", __func__);
+                    return DAQ_RSTAT_ERROR;
+                }
+            }
+            /* All good! A packet should be waiting for us somewhere. */
+            return DAQ_RSTAT_OK;
+        }
+        /* If we were interrupted by a signal, start the loop over.  The user should call daq_interrupt to actually exit. */
+        if (ret < 0 && errno != EINTR)
+        {
+            SET_ERROR(viotc->modinst, "%s: Poll failed: %s (%d)", __func__, strerror(errno), errno);
+            return DAQ_RSTAT_ERROR;
+        }
+#endif
+    }
+    return DAQ_RSTAT_TIMEOUT;
 }
 
 static unsigned virtio_tap_daq_msg_receive(void *handle, const unsigned max_recv, const DAQ_Msg_t *msgs[], DAQ_RecvStatus *rstat)
 {
     struct timeval start, now;
     unsigned idx = 0;
-    VirtioTap_Context_t *afpc = (VirtioTap_Context_t *)handle;
+    int ret;
+    VirtioTap_Context_t *viotc = (VirtioTap_Context_t *)handle;
 
     gettimeofday(&start, NULL);
+    printf("%s():\n", __func__);
 
-    //if (afpc->debug)
-        //printf("%s():\n", __func__);
+    if (viotc->debug)
+        printf("%s():\n", __func__);
     while (idx < max_recv)
     {
-        if (afpc->interrupted)
+        if (viotc->interrupted)
         {
-            afpc->interrupted = false;
+            printf("WLR: Got interrupted....\n");
+            viotc->interrupted = false;
             *rstat = DAQ_RSTAT_INTERRUPTED;
             break;
         }
-        if (afpc->timeout) {
+        ret = wait_for_packet(viotc);
+        printf("WLR: wait for packet rc=%d\n", ret);
+        if (viotc->timeout) {
             gettimeofday(&now, NULL);
             if (((now.tv_sec - start.tv_sec) * 1000 +
-                (now.tv_usec - start.tv_usec) / 1000) > afpc->timeout) {
+                (now.tv_usec - start.tv_usec) / 1000) > viotc->timeout) {
                  *rstat = DAQ_RSTAT_TIMEOUT;
-                //if (afpc->debug)
+                //if (viotc->debug)
                 //    printf("%s: timeout\n", __func__);
                 break;
              }

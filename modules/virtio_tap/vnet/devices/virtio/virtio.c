@@ -124,7 +124,7 @@ virtio_vring_init (vlib_main_t * vm, virtio_if_t * vif, u16 idx, u16 sz)
   vring->kick_fd = eventfd (0, EFD_NONBLOCK | EFD_CLOEXEC);
   virtio_log_debug (vif, "vring %u size %u call_fd %d kick_fd %d", idx,
 		    vring->size, vring->call_fd, vring->kick_fd);
-  printf("WLR: vring %u size %u call_fd %d kick_fd %d\n", idx,
+  printf("WLR: vring %u %p:%p size %u call_fd %d kick_fd %d\n", idx, vring, vif->rxq_vrings,
 		    vring->size, vring->call_fd, vring->kick_fd);
 
   t.read_function = call_read_ready;
@@ -132,8 +132,9 @@ virtio_vring_init (vlib_main_t * vm, virtio_if_t * vif, u16 idx, u16 sz)
   t.private_data = vif->dev_instance << 16 | idx;
   t.description = format (0, "%U vring %u", format_virtio_device_name,
 			  vif->dev_instance, idx);
+#ifdef WLR_SKIP
   vring->call_file_index = clib_file_add (&file_main, &t);
-
+#endif
   return 0;
 }
 
@@ -230,9 +231,13 @@ virtio_vring_set_numa_node (vlib_main_t * vm, virtio_if_t * vif, u32 idx)
   u32 thread_index;
   virtio_vring_t *vring =
     vec_elt_at_index (vif->rxq_vrings, RX_QUEUE_ACCESS (idx));
+#ifdef WLR_SKIP
   thread_index =
     vnet_get_device_input_thread_index (vnm, vif->hw_if_index,
 					RX_QUEUE_ACCESS (idx));
+#else
+  thread_index = 0;
+#endif WLR_SKIP
   vring->buffer_pool_index =
     vlib_buffer_pool_get_default_for_numa (vm,
 					   vlib_mains
