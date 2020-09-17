@@ -33,6 +33,7 @@
 #include <vnet/ip/ip6_packet.h>
 #include <vnet/devices/virtio/virtio.h>
 #include <vnet/devices/virtio/pci.h>
+#include "daq_virtio_tap.h"
 
 virtio_main_t virtio_main;
 
@@ -122,9 +123,9 @@ virtio_vring_init (vlib_main_t * vm, virtio_if_t * vif, u16 idx, u16 sz)
   vring->size = sz;
   vring->call_fd = eventfd (0, EFD_NONBLOCK | EFD_CLOEXEC);
   vring->kick_fd = eventfd (0, EFD_NONBLOCK | EFD_CLOEXEC);
-  virtio_log_debug (vif, "vring %u size %u call_fd %d kick_fd %d", idx,
+  virtio_log_debug (vif, "vring %u size %u call_fd %d kick_fd %d", vif->dev_instance << 16 |idx,
 		    vring->size, vring->call_fd, vring->kick_fd);
-  printf("WLR: vring %u %p:%p size %u call_fd %d kick_fd %d\n", idx, vring, vif->rxq_vrings,
+  printf("WLR2: vring %u %p:%p size %u call_fd %d kick_fd %d\n", vif->dev_instance << 16 | idx, vring, vif->rxq_vrings,
 		    vring->size, vring->call_fd, vring->kick_fd);
 
   t.read_function = call_read_ready;
@@ -134,6 +135,8 @@ virtio_vring_init (vlib_main_t * vm, virtio_if_t * vif, u16 idx, u16 sz)
 			  vif->dev_instance, idx);
 #ifdef WLR_SKIP
   vring->call_file_index = clib_file_add (&file_main, &t);
+#else
+  vring->call_file_index = virto_add_epoll_fd(vif, vring, idx);
 #endif
   return 0;
 }

@@ -40,6 +40,7 @@
 
 #include "daq_dlt.h"
 #include "daq_module_api.h"
+#include "daq_virtio_tap.h"
 
 typedef unsigned char u8;
 typedef unsigned short u16;
@@ -115,11 +116,6 @@ typedef struct _virtio_tap_msg_pool
     DAQ_MsgPoolInfo_t info;
 } VirtioTapMsgPool;
 
-typedef struct
-{
-    int epoll_fd;
-} virtio_tap_main_t;
-
 typedef struct _virtio_tap_context
 {
     /* Configuration */
@@ -137,18 +133,20 @@ typedef struct _virtio_tap_context
     VirtioTapMsgPool pool;
     VirtioTapInstance *instances;
     uint32_t intf_count;
-    virtio_tap_main_t viotm;
     volatile bool interrupted;
     DAQ_Stats_t stats;
     /* Message receive state */
     VirtioTapInstance *curr_instance;
 } VirtioTap_Context_t;
 
+int epoll_fd = -1;
+
 #ifdef WLR_USE_VPP_NOW
 typedef struct
 {
   u8 *data;
 } vnet_netlink_msg_t;
+
 
 // TODO: What to do with this struct from vlib/main.c?
 //vlib_main_t vlib_global_main;
@@ -229,8 +227,8 @@ static int virtio_tap_daq_module_load(const DAQ_BaseAPI_t *base_api)
     printf("%s():\n", __func__);
     if (base_api->api_version != DAQ_BASE_API_VERSION || base_api->api_size != sizeof(DAQ_BaseAPI_t))
         return DAQ_ERROR;
-
     daq_base_api = *base_api;
+    epoll_fd = epoll_create(1);
 
     return DAQ_SUCCESS;
 }
@@ -571,16 +569,47 @@ static int virtio_create_tap_interface(VirtioTap_Context_t *viotc, VirtioTapInst
     return DAQ_SUCCESS;
 }
 #endif // WLR_USE_VPP
+#define WLR_MY_EPOOL_ADD 1
+#ifdef WLR_MY_EPOOL_ADD
+int virto_add_epoll_fd(virtio_if_t * vif, virtio_vring_t *vring, int idx)
+{
+    int rc = 0;
+    struct epoll_event e = { 0 };
+    e.events = EPOLLIN;
+    e.data.u32 = idx;
+
+    if (epoll_fd == -1)
+    {
+        epoll_fd = epoll_create (1);
+    }
+
+    printf("WLR: epoll_fd %d call_fd %d vring %p\n", epoll_fd, vring->call_fd, vring);
+    rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, vring->call_fd, &e);
+    return idx;
+}
+#else
 static int virto_add_epoll_fd(VirtioTapInstance *instance, VirtioTap_Context_t *viotc)
 {
     int rc = 0;
     struct epoll_event e = { 0 };
     e.events = EPOLLIN;
-    e.data.u32 = instance->ifindex;
+    e.data.u32 = RX_QUEUE(instance->ifindex);
+//    e.data.u32 = instance->ifindex;
+    virtio_vring_t *vring;
 
+    vring = vec_elt_at_index (instance->vif->rxq_vrings, RX_QUEUE_ACCESS(instance->ifindex));
+
+    printf("WLR: epoll_fd %d call_fd %d vring %p\n", viotc->epoll_fd, vring->call_fd, vring);
+    vring = vec_elt_at_index (instance->vif->txq_vrings, TX_QUEUE_ACCESS(instance->ifindex));
+    printf("WLR: epoll_fd %d call_fd %d vring %p\n", viotc->epoll_fd, vring->call_fd, vring);
+    printf("WLR: epoll_fd %d call_fd %d vring %p\n", viotc->epoll_fd, instance->vif->rxq_vrings[1].call_fd,viotc->epoll_fd, &instance->vif->rxq_vrings[1]);
     rc = epoll_ctl(viotc->epoll_fd, EPOLL_CTL_ADD, instance->vif->rxq_vrings[0].call_fd, &e);
+    e.events = EPOLLIN;
+    e.data.u32 = TX_QUEUE(instance->ifindex);
+    rc = epoll_ctl(viotc->epoll_fd, EPOLL_CTL_ADD, instance->vif->rxq_vrings[1].call_fd, &e);
     return rc;
 }
+#endif WLR_MY_EPOOL_ADD
 
 static VirtioTapInstance *create_instance(VirtioTap_Context_t *viotc, const char *device, const char *namespace)
 {
@@ -591,7 +620,7 @@ static VirtioTapInstance *create_instance(VirtioTap_Context_t *viotc, const char
     virtio_if_t *vif;
     //int val;
 
-    printf("WLR: %s\n", __func__);
+    printf("WLR: %s()\n", __func__);
     memset(&tapd,0, sizeof(tap_create_if_args_t));
     tapd.id = ~0;
     instance = calloc(1, sizeof(VirtioTapInstance));
@@ -635,9 +664,10 @@ static VirtioTapInstance *create_instance(VirtioTap_Context_t *viotc, const char
         printf("WLR: Tap create failed, rv %d, if idx %u, if name %s\n", tapd.rv, tapd.sw_if_index, tapd.host_if_name);
         return NULL;
     }
-
+#ifndef WLR_MY_EPOOL_ADD
     printf("WLR: virto_add_epoll_fd\n");
     virto_add_epoll_fd(instance,viotc);
+#endif WLR_MY_EPOOL_ADD
 
 #ifdef WLR_SKIP
     if (virtio_create_tap_interface(viotc, instance)) {
@@ -799,7 +829,6 @@ static int virtio_tap_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_Modul
     int rval = DAQ_ERROR;
     clib_error_t *err;
     vlib_main_t *vm = &vlib_global_main;  /* one and only time for this! */
-    virtio_tap_main_t *vtm;
 
     //clib_mem_init (0, 64ULL << 10);
     clib_mem_init_thread_safe (0, 128 << 20);
@@ -861,13 +890,14 @@ static int virtio_tap_daq_instantiate(const DAQ_ModuleConfig_h modcfg, DAQ_Modul
     viotc->modinst = modinst;
 
     /* TODO: May need mutex lock here?? */
-    vtm = &viotc->viotm;
-    vtm->epoll_fd = epoll_create (1);
-    if (vtm->epoll_fd < 0)
+#ifdef WLR_SKIP_EPOLL
+    viotc->epoll_fd = epoll_create (1);
+    if (viotc->epoll_fd < 0)
     {
-        printf("Error creating epoll, %s(%d)\n", strerror(vtm->epoll_fd), vtm->epoll_fd);
+        printf("Error creating epoll, %s(%d)\n", strerror(viotc->epoll_fd), viotc->epoll_fd);
         return rval;
     }
+#endif WLR_SKIP_EPOLL
 
     viotc->device = strdup(daq_base_api.config_get_input(modcfg));
     if (!viotc->device)
@@ -998,10 +1028,80 @@ static int virtio_tap_daq_get_datalink_type(void *handle)
     return DLT_EN10MB;
 }
 
+#define VIRTIO_INPUT_ERROR_BUFFER_ALLOC 1
+//static inline void
+void
+virtio_refill_vring (vlib_main_t * vm, virtio_if_t * vif,
+		     virtio_if_type_t type, virtio_vring_t * vring,
+		     const int hdr_sz, u32 node_index)
+{
+  u16 used, next, avail, n_slots, n_refill;
+  u16 sz = vring->size;
+  u16 mask = sz - 1;
+
+more:
+  used = vring->desc_in_use;
+
+  if (sz - used < sz / 8)
+    return;
+
+  /* deliver free buffers in chunks of 64 */
+  n_refill = clib_min (sz - used, 64);
+
+  next = vring->desc_next;
+  avail = vring->avail->idx;
+  n_slots =
+    vlib_buffer_alloc_to_ring_from_pool (vm, vring->buffers, next,
+					 vring->size, n_refill,
+					 vring->buffer_pool_index);
+
+  if (PREDICT_FALSE (n_slots != n_refill))
+    {
+      vlib_error_count (vm, node_index,
+			VIRTIO_INPUT_ERROR_BUFFER_ALLOC, n_refill - n_slots);
+      if (n_slots == 0)
+	return;
+    }
+
+  while (n_slots)
+    {
+      struct vring_desc *d = &vring->desc[next];;
+      vlib_buffer_t *b = vlib_get_buffer (vm, vring->buffers[next]);
+      /*
+       * current_data may not be initialized with 0 and may contain
+       * previous offset. Here we want to make sure, it should be 0
+       * initialized.
+       */
+      b->current_data = -hdr_sz;
+      memset (vlib_buffer_get_current (b), 0, hdr_sz);
+      d->addr =
+	((type == VIRTIO_IF_TYPE_PCI) ? vlib_buffer_get_current_pa (vm,
+								    b) :
+	 pointer_to_uword (vlib_buffer_get_current (b)));
+      d->len = vlib_buffer_get_default_data_size (vm) + hdr_sz;
+      d->flags = VRING_DESC_F_WRITE;
+      vring->avail->ring[avail & mask] = next;
+      avail++;
+      next = (next + 1) & mask;
+      n_slots--;
+      used++;
+    }
+  CLIB_MEMORY_STORE_BARRIER ();
+  vring->avail->idx = avail;
+  vring->desc_next = next;
+  vring->desc_in_use = used;
+
+  if ((vring->used->flags & VIRTIO_RING_FLAG_MASK_INT) == 0)
+    {
+      printf("WLR: virtio_kick()\n");
+      virtio_kick (vm, vring, vif);
+    }
+  goto more;
+}
+
 static inline DAQ_RecvStatus wait_for_packet(VirtioTap_Context_t *viotc)
 {
     VirtioTapInstance *instance;
-//    struct pollfd pfd[AF_PACKET_MAX_INTERFACES];
     uint32_t i;
     printf("%s(): nun instances %d\n", __func__, viotc->intf_count);
     virtio_if_t *vif;
@@ -1010,24 +1110,31 @@ static inline DAQ_RecvStatus wait_for_packet(VirtioTap_Context_t *viotc)
     int n_fds_ready;
     struct epoll_event events[AF_PACKET_MAX_INTERFACES];
     static sigset_t unblock_all_signals;
-
+    int hdr_sz;
+    u16 mask, last, n_left;
+    vlib_main_t * vm = vlib_get_main();
+    memset(events,0, sizeof(struct epoll_event)*AF_PACKET_MAX_INTERFACES);
 
     for (i = 0, instance = viotc->instances; instance; i++, instance = instance->next)
     {
         vif = instance->vif;
+        hdr_sz = vif->virtio_net_hdr_sz;
         vring = vec_elt_at_index (vif->rxq_vrings, RX_QUEUE_ACCESS(0));
-        events[i].events = EPOLLIN;
-        events[i].data.u32 = vring->call_fd;
-        used = vif->rxq_vrings[0].used;
-        printf("idx %d VIF %p, vring %p, call_fd %d, used: %d", i, vif, vif->rxq_vrings, vring->call_fd, used->idx);
-//        printf("call_fd(%d): %p:%p  %d ", i, vring, vif->rxq_vrings, vring->call_fd);
-#ifdef WLR_SKIP
-        pfd[i].fd = vring->call_fd;
-        pfd[i].revents = 0;
-        pfd[i].events = POLLIN;
-#endif
+        mask = vring->size - 1;
+        last = vring->last_used_idx;
+        n_left = vring->used->idx - last;
+        if (n_left == 0)
+            goto refill;
+        events[RX_QUEUE(i)].events = EPOLLIN;
+        events[RX_QUEUE(i)].data.u32 = vring->call_fd;
+        used = vring->used;
+        printf("rx idx %d VIF %p, vring %p, call_fd %d, kick_fd %d, used: %d\n", vif->dev_instance << 16 | RX_QUEUE(i), vif, vring, vring->call_fd, vring->kick_fd, used->idx);
+        vring = vec_elt_at_index (vif->txq_vrings, TX_QUEUE_ACCESS(0));
+        used = vring->used;
+        events[TX_QUEUE(i)].events = EPOLLIN;
+        events[TX_QUEUE(i)].data.u32 = vring->call_fd;
+        printf("tx idx %d VIF %p, vring %p, call_fd %d, kick_fd %d, used: %d\n", vif->dev_instance << 16 | TX_QUEUE(i), vif, vring, vring->call_fd, vring->kick_fd, used->idx);
     }
-    printf("\n");
     /* Chop the timeout into one second chunks (plus any remainer) to improve responsiveness to
         interruption when there is no traffic and the timeout is very long (or unlimited). */
     int timeout = viotc->timeout;
@@ -1053,14 +1160,21 @@ static inline DAQ_RecvStatus wait_for_packet(VirtioTap_Context_t *viotc)
         }
         else
             poll_timeout = 1000;
-
-        n_fds_ready = epoll_pwait(viotc->viotm.epoll_fd, &events, viotc->intf_count, poll_timeout, &unblock_all_signals);
-        printf("WLR: n_fds_ready=%d\n", n_fds_ready);
+        printf("WLR: input sigmask: 0x%X\n", unblock_all_signals);
+        n_fds_ready = epoll_pwait(epoll_fd, events, viotc->intf_count*2, poll_timeout, &unblock_all_signals);
+        printf("WLR: epoll_fd=%d,  n_fds_ready=%d, errno=%d, sigs: 0x%X\n", epoll_fd, n_fds_ready, errno, unblock_all_signals);
         if (n_fds_ready > 0)
         {
             printf("WLR: got one!\n");
             exit(1);
         }
+        struct epoll_event *e;
+
+        for (i=0;i<viotc->intf_count; i++)
+        {
+            printf("WLR: idx %d, events %d, data %d\n", i, events[i].events, events[i].data.u32);
+        }
+
 #ifdef WLR_SKIP
         //int ret = poll(pfd, viotc->intf_count, poll_timeout);
         /* If some number of of sockets have events returned, check them all for badness. */
@@ -1090,6 +1204,12 @@ static inline DAQ_RecvStatus wait_for_packet(VirtioTap_Context_t *viotc)
         }
 #endif
     }
+
+    return DAQ_RSTAT_TIMEOUT;
+
+refill:
+    virtio_refill_vring (vm, vif, vif->type, vring, hdr_sz, 0 /* node->node_index */);
+
     return DAQ_RSTAT_TIMEOUT;
 }
 
