@@ -5,7 +5,7 @@ A DAQ module built on top of the Linux netfilter packet filtering framework.
 Specifically, the module operates on packets queued by the kernel packet filter
 for userspace consumption via the NFQUEUE mechanism, usually controlled by
 iptables rules.  The input specification given to the DAQ module should be the
-integer value of the queue number to receive and process packets on.
+integer value of the queue number to receive and process packets on.  You can optionally provide a network namespace path to be able to receive and process packets from a different network namespace, such as from a docker or kubernetes container.
 
 Packets will come up to the application with a datalink type of "RAW", which
 means the packet data begins with the IP header.
@@ -64,7 +64,17 @@ Limitations
 * Multiple instantiation is technically supported, but there is currently no
 way to handle the same queue in multiple instances.  For now, the best way to
 use multiple instances is to have each listen on its own queue.
+* True mutiple instantion support.  The ability to load balance with netfilter nfqueue is needed to properly support.  It can be configured with netfilter using the "--queue-balance --queue-num x:y" options.  However, my Web searches indicate this option may not work with many Kernel versions.  Also, these options may not be available in all implementations and kernel versions, and may require custom nfqueue netfilter package to be added.
 
+        iptables -A FORWARD -j NFQUEUE --queue-balance --queue-num 0:5
+
+* Changes in my fork of nfq libdaq.  This implementation of nfqueue (unlike the non-forked nfq libdaq) has the following enhancements:
+	*  Uses seperate rx, packet processing, and tx threads to increase performance.  When true support for multiple instantiation is addressed, the rx and tx threads should be removed.
+	*  Adds support for specifying a network namespace (using netns_path option) to provide the ability to open nfq socket inside a different docker or kubernetes container than the one where libdaq and its apllication are running.  This should be re-done to add it to the interface config instead (see virtio libdaq in this fork as an example) Example syntax.
+	
+	  `
+	  	snort3 -Q -v -z 1 -i 42 --daq nfq --daq-var netns_path "/var/run/netns/pod2" ...
+	  `
 * Last I checked, the process cannot operate in unprivileged mode.  This needs
 to be revalidated, but the module is marked as such in the meantime.
 
